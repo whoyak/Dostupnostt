@@ -521,7 +521,7 @@ def get_mock_region_data(region_code):
     # Генерация сообщения базового слоя
     base_layer_msg = f'{region_code} Базовый слой {formatted}\n\n'
     for i in range(1, 6):
-        base_layer_msg += f'{i}) BS_{region_code}_{i:03d} LTE800\n'
+        base_layer_msg += f'{i}) {region_code}_BS_{i:03d} LTE800\n'
         base_layer_msg += f'Power Да; Посещение Да; WO Нет\n'
 
     base_layer_msg += f'\nВсего активных POWER на сети: {power_problems}\n'
