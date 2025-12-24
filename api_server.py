@@ -1,5 +1,5 @@
 """
-API СЕРВЕР ДЛЯ ДОСТУПНОСТИ РЕГИОНОВ
+API СЕРВЕР ДЛЯ ДОСТУПНОСТИ РЕГИОНОВ С ИСТОРИЧЕСКИМИ ДАННЫМИ
 Запускается на Render.com
 """
 
@@ -61,12 +61,13 @@ def test_connection():
         'success': True,
         'message': 'API Dostupnost работает нормально',
         'timestamp': datetime.now().isoformat(),
-        'version': '1.0.0'
+        'version': '1.0.0',
+        'features': ['current_data', 'full_history', 'historical_view']
     })
 
 @app.route('/api/region/<region_code>', methods=['GET'])
 def get_region_data(region_code):
-    """Получение данных региона"""
+    """Получение текущих данных региона"""
     try:
         # Пробуем загрузить конкретный файл региона
         filename = f"region_{region_code}.json"
@@ -107,7 +108,7 @@ def get_region_data(region_code):
 
 @app.route('/api/region/<region_code>/history', methods=['GET'])
 def get_region_history(region_code):
-    """Получение истории региона"""
+    """Получение истории региона (список записей)"""
     try:
         # Получаем параметр hours
         hours = int(request.args.get('hours', 24))
@@ -123,7 +124,7 @@ def get_region_history(region_code):
                 filtered_history = []
                 for item in data.get('history', []):
                     try:
-                        item_time = datetime.fromisoformat(item.get('created_at', '2000-01-01').replace('Z', '+00:00'))
+                        item_time = datetime.fromisoformat(item.get('full_timestamp', '2000-01-01').replace('Z', '+00:00'))
                         if item_time > cutoff_time:
                             filtered_history.append(item)
                     except:
@@ -145,7 +146,7 @@ def get_region_history(region_code):
                 filtered_history = []
                 for item in history:
                     try:
-                        item_time = datetime.fromisoformat(item.get('created_at', '2000-01-01').replace('Z', '+00:00'))
+                        item_time = datetime.fromisoformat(item.get('full_timestamp', '2000-01-01').replace('Z', '+00:00'))
                         if item_time > cutoff_time:
                             filtered_history.append(item)
                     except:
@@ -158,7 +159,8 @@ def get_region_history(region_code):
                 'region_code': region_code,
                 'history': history,
                 'count': len(history),
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.now().isoformat(),
+                'message': 'Полная история с данными'
             })
         
         # Если истории нет, возвращаем пустую
@@ -167,7 +169,8 @@ def get_region_history(region_code):
             'region_code': region_code,
             'history': [],
             'count': 0,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
+            'message': 'История пока пуста'
         })
         
     except Exception as e:
@@ -177,20 +180,91 @@ def get_region_history(region_code):
             'region_code': region_code
         }), 500
 
+@app.route('/api/region/<region_code>/history/<timestamp>', methods=['GET'])
+def get_historical_data(region_code, timestamp):
+    """Получение данных региона на конкретный момент времени"""
+    try:
+        # Преобразуем timestamp из URL в нормальный формат
+        timestamp = timestamp.replace('-', ':').replace('T', ' ')
+        
+        # Сначала пробуем загрузить конкретный файл исторических данных
+        filename = f"history_{region_code}_{timestamp}.json"
+        data = fetch_from_github(filename)
+        
+        if data and data.get('historical_data'):
+            return jsonify({
+                'success': True,
+                'is_historical': True,
+                'historical_timestamp': timestamp,
+                'data': data['historical_data']
+            })
+        
+        # Если нет отдельного файла, ищем в общей истории
+        history_response = fetch_from_github(f"history_{region_code}.json")
+        if history_response and history_response.get('history'):
+            # Ищем запись с ближайшим timestamp
+            target_time = None
+            try:
+                target_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            except:
+                pass
+            
+            closest_item = None
+            if target_time:
+                for item in history_response['history']:
+                    item_time = datetime.fromisoformat(item.get('full_timestamp', '2000-01-01').replace('Z', '+00:00'))
+                    if not closest_item or abs((item_time - target_time).total_seconds()) < abs((closest_item_time - target_time).total_seconds()):
+                        closest_item = item
+                        closest_item_time = item_time
+            
+            if closest_item:
+                return jsonify({
+                    'success': True,
+                    'is_historical': True,
+                    'historical_timestamp': timestamp,
+                    'data': closest_item
+                })
+        
+        # Ищем в кэше
+        cached_data = get_cached_data()
+        if cached_data and region_code in cached_data:
+            history = cached_data[region_code].get('history', [])
+            
+            # Ищем по timestamp
+            for item in history:
+                if item.get('full_timestamp', '').startswith(timestamp) or item.get('timestamp', '') == timestamp:
+                    return jsonify({
+                        'success': True,
+                        'is_historical': True,
+                        'historical_timestamp': timestamp,
+                        'data': item
+                    })
+        
+        return jsonify({
+            'success': False,
+            'error': f'Исторические данные для {region_code} на время {timestamp} не найдены',
+            'region_code': region_code,
+            'timestamp': timestamp
+        }), 404
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'region_code': region_code,
+            'timestamp': timestamp
+        }), 500
+
 @app.route('/api/region/<region_code>/refresh', methods=['POST'])
 def refresh_region_data(region_code):
     """Принудительное обновление данных региона"""
     try:
-        # В реальности здесь можно было бы запросить обновление у сборщика
-        # Но пока просто возвращаем текущие данные с пометкой об обновлении
-        
         data = fetch_from_github(f"region_{region_code}.json")
         if data:
             data['forced_refresh'] = True
             data['refresh_timestamp'] = datetime.now().isoformat()
             return jsonify(data)
         
-        # Если данных нет, возвращаем mock с пометкой обновления
         return jsonify({
             'success': True,
             'region_code': region_code,
@@ -232,7 +306,8 @@ def get_all_regions():
                         'total_bs': stats.get('total_bs', 0),
                         'base_layer_percentage': stats.get('base_layer_percentage', 0),
                         'power_problems': stats.get('power_problems', 0),
-                        'last_updated': current.get('timestamp', '00:00:00')
+                        'last_updated': current.get('timestamp', '00:00:00'),
+                        'has_history': len(data.get('history', [])) > 0
                     })
             
             return jsonify({
@@ -242,7 +317,6 @@ def get_all_regions():
                 'timestamp': datetime.now().isoformat()
             })
         
-        # Если данных нет, возвращаем пустой список
         return jsonify({
             'success': True,
             'regions': [],
@@ -262,7 +336,8 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
-        'service': 'dostupnost-api'
+        'service': 'dostupnost-api',
+        'features': ['current_data', 'historical_data', 'full_history']
     })
 
 if __name__ == '__main__':
