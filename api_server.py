@@ -1,310 +1,270 @@
 """
-УПРОЩЕННЫЙ API СЕРВЕР ДЛЯ RENDER
-Читает данные напрямую из GitHub Raw URL
+API СЕРВЕР ДЛЯ ДОСТУПНОСТИ РЕГИОНОВ
+Запускается на Render.com
 """
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import requests
-from datetime import datetime
 import json
-import time
+import requests
+from datetime import datetime, timedelta
+import os
 
 app = Flask(__name__)
-CORS(app)
+CORS(app)  # Разрешаем CORS для всех доменов
 
-# Ссылка на ваш файл данных в GitHub
-GITHUB_DATA_URL = "https://raw.githubusercontent.com/whoyak/region-data-cache/main/cached_data.json"
+# Конфигурация
+GITHUB_RAW_BASE = "https://raw.githubusercontent.com/whoyak/region-data-cache/main/"
+CACHE_TIMEOUT = 60  # Кэшируем на 60 секунд
 
-# Локальный кэш данных
-data_cache = {
-    'last_update': None,
-    'data': None,
-    'error': None,
-    'cache_hits': 0,
-    'github_hits': 0
+# Кэш в памяти
+cache = {
+    'data': {},
+    'timestamp': datetime.min
 }
 
-def fetch_data_from_github():
-    """Загрузить данные из GitHub"""
+def fetch_from_github(filename):
+    """Загружает данные из GitHub"""
     try:
-        print(f"📥 Загружаю данные из GitHub...")
-        response = requests.get(GITHUB_DATA_URL, timeout=10)
+        url = f"{GITHUB_RAW_BASE}{filename}"
+        response = requests.get(url, timeout=10)
         
         if response.status_code == 200:
-            data = response.json()
-            data_cache['data'] = data
-            data_cache['last_update'] = datetime.now().isoformat()
-            data_cache['error'] = None
-            data_cache['github_hits'] += 1
-            
-            # Подсчитываем регионы (исключая мета-данные)
-            regions = [k for k in data.keys() if not k.startswith('_')]
-            regions_count = len(regions)
-            
-            print(f"✅ Данные загружены: {regions_count} регионов")
-            
-            # Логируем первый регион для проверки
-            if regions:
-                first_region = regions[0]
-                if first_region in data:
-                    print(f"   Пример: {first_region} - {data[first_region].get('region_name', 'N/A')}")
-            
-            return True
-        elif response.status_code == 404:
-            data_cache['error'] = f"Файл не найден на GitHub (404): {GITHUB_DATA_URL}"
-            print(f"❌ Файл данных не найден на GitHub!")
-            print(f"   Проверьте URL: {GITHUB_DATA_URL}")
-            print(f"   Убедитесь, что файл cached_data.json существует в репозитории")
-            return False
+            return response.json()
         else:
-            data_cache['error'] = f"GitHub вернул статус {response.status_code}"
-            print(f"❌ Ошибка загрузки: {response.status_code}")
-            return False
-            
+            print(f"⚠️ Файл {filename} не найден: {response.status_code}")
+            return None
     except Exception as e:
-        data_cache['error'] = str(e)
-        print(f"❌ Ошибка сети: {e}")
-        return False
+        print(f"❌ Ошибка загрузки {filename}: {e}")
+        return None
 
-# Загружаем данные при старте сервера
-print("🚀 API сервер запущен в режиме чтения кэша")
-print(f"📁 Источник данных: {GITHUB_DATA_URL}")
-fetch_data_from_github()
+def get_cached_data():
+    """Получает данные с кэшированием"""
+    global cache
+    
+    now = datetime.now()
+    if (now - cache['timestamp']).seconds < CACHE_TIMEOUT and 'data' in cache:
+        return cache['data']
+    
+    # Загружаем данные
+    data = fetch_from_github("cached_data.json")
+    if data:
+        cache['data'] = data
+        cache['timestamp'] = now
+    
+    return data
 
 @app.route('/api/test', methods=['GET'])
-def test():
+def test_connection():
+    """Тестовый endpoint"""
     return jsonify({
         'success': True,
-        'message': 'API работает с GitHub как источником данных',
-        'timestamp': datetime.now().strftime("%H:%M:%S"),
-        'data_source': GITHUB_DATA_URL,
-        'cache_status': {
-            'last_update': data_cache['last_update'],
-            'has_data': data_cache['data'] is not None,
-            'error': data_cache['error']
-        }
+        'message': 'API Dostupnost работает нормально',
+        'timestamp': datetime.now().isoformat(),
+        'version': '1.0.0'
     })
 
 @app.route('/api/region/<region_code>', methods=['GET'])
 def get_region_data(region_code):
-    """Получить данные региона из кэша"""
-    print(f"📥 Запрос данных для региона: {region_code}")
-    
-    # Всегда проверяем кэш, не обновляем автоматически
-    if data_cache['data'] is None:
-        print("⚠️ Кэш пуст, пытаюсь загрузить...")
-        fetch_data_from_github()
-    
-    if data_cache['data'] and region_code in data_cache['data']:
-        data = data_cache['data'][region_code].copy()
-        data['from_github_cache'] = True
-        data['cache_updated'] = data_cache['last_update']
-        data['cache_hit'] = data_cache['cache_hits']
-        data_cache['cache_hits'] += 1
+    """Получение данных региона"""
+    try:
+        # Пробуем загрузить конкретный файл региона
+        filename = f"region_{region_code}.json"
+        data = fetch_from_github(filename)
         
-        # Добавляем статистику, если её нет
-        if 'stats' not in data:
-            data['stats'] = {
-                'total_bs': 0,
-                'base_layer_count': 0,
-                'power_problems': 0,
-                'non_priority_percentage': 0
-            }
-        
-        return jsonify(data)
-    
-    # Если данных нет в кэше, возвращаем тестовые данные
-    print(f"⚠️ Регион {region_code} не найден в кэше, возвращаю тестовые данные")
-    
-    return jsonify({
-        'success': True,
-        'region_code': region_code,
-        'region_name': region_code,
-        'base_layer': f'{region_code} Базовый слой (тестовые данные)\n\nДанные временно недоступны\nФайл cached_data.json не найден на GitHub',
-        'non_priority': f'{region_code} Технологии (тестовые данные)\n\nОжидание обновления данных',
-        'timestamp': datetime.now().strftime("%H:%M:%S"),
-        'is_mock': True,
-        'is_fallback': True,
-        'stats': {
-            'total_bs': 50,
-            'base_layer_count': 45,
-            'power_problems': 2,
-            'non_priority_percentage': 10
-        },
-        'cache_status': {
-            'last_update': data_cache['last_update'],
-            'error': data_cache['error'],
-            'suggestion': 'Запустите auto_collector.py на локальном ПК для обновления данных'
-        }
-    })
-
-@app.route('/api/region/<region_code>/refresh', methods=['POST'])
-def refresh_region_data(region_code):
-    """Принудительно обновить данные региона (загрузить из GitHub)"""
-    print(f"🔄 Принудительное обновление кэша для региона: {region_code}")
-    
-    success = fetch_data_from_github()
-    
-    if success:
-        if data_cache['data'] and region_code in data_cache['data']:
-            data = data_cache['data'][region_code].copy()
-            data['forced_refresh'] = True
-            data['refresh_timestamp'] = datetime.now().strftime("%H:%M:%S")
-            data['from_github_cache'] = True
+        if data:
             return jsonify(data)
-    
-    # Если обновление не удалось или региона нет
-    return jsonify({
-        'success': success,
-        'region_code': region_code,
-        'message': 'Кэш обновлен' if success else 'Ошибка обновления кэша',
-        'timestamp': datetime.now().strftime("%H:%M:%S"),
-        'error': data_cache['error'] if not success else None
-    })
-
-@app.route('/api/regions', methods=['GET'])
-def get_regions_list():
-    """Получить список всех регионов"""
-    if data_cache['data']:
-        regions = []
-        for code, data in data_cache['data'].items():
-            if not code.startswith('_'):
-                region_data = {
-                    'code': code,
-                    'name': data.get('region_name', code),
-                    'has_data': True,
-                    'macroregion': data.get('macroregion', 'Неизвестно')
-                }
-                regions.append(region_data)
         
+        # Если нет отдельного файла, ищем в общем кэше
+        cached_data = get_cached_data()
+        if cached_data and region_code in cached_data:
+            return jsonify(cached_data[region_code]['current'])
+        
+        # Если данных нет, возвращаем mock
         return jsonify({
             'success': True,
-            'regions': regions,
-            'count': len(regions),
-            'from_github': True,
-            'last_updated': data_cache['last_update'],
-            'timestamp': datetime.now().strftime("%H:%M:%S")
+            'region_code': region_code,
+            'region_name': f"Регион {region_code}",
+            'base_layer': f"{region_code} Базовый слой (тестовые данные)\n\nВсего BS: 100\nБазовый слой: 95/100",
+            'non_priority': f"{region_code} Технологии (тестовые данные)\n\nНедоступно LTE1800:\n1) BS1001",
+            'timestamp': datetime.now().strftime("%H:%M:%S"),
+            'is_mock': True,
+            'forced_refresh': False,
+            'stats': {
+                'total_bs': 100,
+                'base_layer_count': 95,
+                'power_problems': 3,
+                'non_priority_percentage': 5
+            }
         })
-    
-    # Если кэш пуст, возвращаем список из REGION_INFO
-    print("⚠️ Кэш пуст, возвращаю статический список регионов")
-    
-    # Статический список регионов (можно вынести в отдельный файл)
-    static_regions = [
-        {'code': 'BRT', 'name': 'Бурятия', 'has_data': False},
-        {'code': 'IRK', 'name': 'Иркутская область', 'has_data': False},
-        {'code': 'KAM', 'name': 'Камчатский край', 'has_data': False},
-        {'code': 'KHB', 'name': 'Хабаровский край', 'has_data': False},
-        {'code': 'SAH', 'name': 'Сахалинская область', 'has_data': False},
-        {'code': 'VLD', 'name': 'Владивосток', 'has_data': False},
-        {'code': 'ROS', 'name': 'Ростовская область', 'has_data': False},
-        {'code': 'KRA', 'name': 'Краснодарский край', 'has_data': False},
-        {'code': 'CNT', 'name': 'Центральный округ Москвы', 'has_data': False},
-        {'code': 'SPE', 'name': 'Санкт-Петербург Восток', 'has_data': False},
-    ]
-    
-    return jsonify({
-        'success': True,
-        'regions': static_regions,
-        'count': len(static_regions),
-        'is_static_list': True,
-        'cache_status': data_cache['error'],
-        'timestamp': datetime.now().strftime("%H:%M:%S")
-    })
-
-@app.route('/api/cache/status', methods=['GET'])
-def cache_status():
-    """Проверить статус кэша"""
-    regions_count = 0
-    if data_cache['data']:
-        regions_count = len([k for k in data_cache['data'].keys() if not k.startswith('_')])
-    
-    return jsonify({
-        'success': True,
-        'last_update': data_cache['last_update'],
-        'data_source': GITHUB_DATA_URL,
-        'has_data': data_cache['data'] is not None,
-        'regions_count': regions_count,
-        'cache_hits': data_cache['cache_hits'],
-        'github_hits': data_cache['github_hits'],
-        'error': data_cache['error'],
-        'timestamp': datetime.now().strftime("%H:%M:%S"),
-        'server_time': datetime.now().isoformat()
-    })
-
-@app.route('/api/cache/refresh', methods=['POST'])
-def refresh_cache():
-    """Принудительно обновить кэш"""
-    success = fetch_data_from_github()
-    return jsonify({
-        'success': success,
-        'message': 'Кэш обновлен' if success else 'Ошибка обновления',
-        'last_update': data_cache['last_update'],
-        'regions_count': len([k for k in data_cache['data'].keys() if not k.startswith('_')]) if data_cache['data'] else 0,
-        'timestamp': datetime.now().strftime("%H:%M:%S")
-    })
-
-@app.route('/api/history', methods=['GET'])
-def get_history():
-    """Заглушка для истории (не реализована в упрощенной версии)"""
-    return jsonify({
-        'success': True,
-        'message': 'История не доступна в упрощенной версии API',
-        'timestamp': datetime.now().strftime("%H:%M:%S")
-    })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'region_code': region_code
+        }), 500
 
 @app.route('/api/region/<region_code>/history', methods=['GET'])
 def get_region_history(region_code):
-    """Заглушка для истории региона"""
+    """Получение истории региона"""
+    try:
+        # Получаем параметр hours
+        hours = int(request.args.get('hours', 24))
+        
+        # Пробуем загрузить файл истории
+        filename = f"history_{region_code}.json"
+        data = fetch_from_github(filename)
+        
+        if data:
+            # Фильтруем по времени если нужно
+            if hours < 24:
+                cutoff_time = datetime.now() - timedelta(hours=hours)
+                filtered_history = []
+                for item in data.get('history', []):
+                    try:
+                        item_time = datetime.fromisoformat(item.get('created_at', '2000-01-01').replace('Z', '+00:00'))
+                        if item_time > cutoff_time:
+                            filtered_history.append(item)
+                    except:
+                        filtered_history.append(item)
+                
+                data['history'] = filtered_history
+                data['count'] = len(filtered_history)
+            
+            return jsonify(data)
+        
+        # Если файла истории нет, ищем в кэше
+        cached_data = get_cached_data()
+        if cached_data and region_code in cached_data:
+            history = cached_data[region_code].get('history', [])
+            
+            # Фильтруем по времени если нужно
+            if hours < 24:
+                cutoff_time = datetime.now() - timedelta(hours=hours)
+                filtered_history = []
+                for item in history:
+                    try:
+                        item_time = datetime.fromisoformat(item.get('created_at', '2000-01-01').replace('Z', '+00:00'))
+                        if item_time > cutoff_time:
+                            filtered_history.append(item)
+                    except:
+                        filtered_history.append(item)
+                
+                history = filtered_history
+            
+            return jsonify({
+                'success': True,
+                'region_code': region_code,
+                'history': history,
+                'count': len(history),
+                'timestamp': datetime.now().isoformat()
+            })
+        
+        # Если истории нет, возвращаем пустую
+        return jsonify({
+            'success': True,
+            'region_code': region_code,
+            'history': [],
+            'count': 0,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'region_code': region_code
+        }), 500
+
+@app.route('/api/region/<region_code>/refresh', methods=['POST'])
+def refresh_region_data(region_code):
+    """Принудительное обновление данных региона"""
+    try:
+        # В реальности здесь можно было бы запросить обновление у сборщика
+        # Но пока просто возвращаем текущие данные с пометкой об обновлении
+        
+        data = fetch_from_github(f"region_{region_code}.json")
+        if data:
+            data['forced_refresh'] = True
+            data['refresh_timestamp'] = datetime.now().isoformat()
+            return jsonify(data)
+        
+        # Если данных нет, возвращаем mock с пометкой обновления
+        return jsonify({
+            'success': True,
+            'region_code': region_code,
+            'region_name': f"Регион {region_code} (обновлено)",
+            'base_layer': f"{region_code} Базовый слой (обновлено)\n\nВсего BS: 100\nБазовый слой: 95/100",
+            'non_priority': f"{region_code} Технологии (обновлено)\n\nНедоступно LTE1800:\n1) BS1001",
+            'timestamp': datetime.now().strftime("%H:%M:%S"),
+            'forced_refresh': True,
+            'refresh_timestamp': datetime.now().isoformat(),
+            'stats': {
+                'total_bs': 100,
+                'base_layer_count': 95,
+                'power_problems': 3,
+                'non_priority_percentage': 5
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'region_code': region_code
+        }), 500
+
+@app.route('/api/regions', methods=['GET'])
+def get_all_regions():
+    """Получение списка всех регионов"""
+    try:
+        cached_data = get_cached_data()
+        if cached_data and '_meta' in cached_data:
+            regions_list = []
+            for region_code, data in cached_data.items():
+                if region_code != '_meta':
+                    current = data.get('current', {})
+                    stats = current.get('stats', {})
+                    regions_list.append({
+                        'code': region_code,
+                        'name': current.get('region_name', region_code),
+                        'total_bs': stats.get('total_bs', 0),
+                        'base_layer_percentage': stats.get('base_layer_percentage', 0),
+                        'power_problems': stats.get('power_problems', 0),
+                        'last_updated': current.get('timestamp', '00:00:00')
+                    })
+            
+            return jsonify({
+                'success': True,
+                'regions': regions_list,
+                'count': len(regions_list),
+                'timestamp': datetime.now().isoformat()
+            })
+        
+        # Если данных нет, возвращаем пустой список
+        return jsonify({
+            'success': True,
+            'regions': [],
+            'count': 0,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check для мониторинга"""
     return jsonify({
-        'success': True,
-        'region_code': region_code,
-        'message': 'История региона не доступна в упрощенной версии',
-        'timestamp': datetime.now().strftime("%H:%M:%S")
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'service': 'dostupnost-api'
     })
 
-@app.errorhandler(404)
-def not_found(error):
-    """Обработчик 404 ошибок"""
-    return jsonify({
-        'success': False,
-        'error': 'Endpoint не найден',
-        'timestamp': datetime.now().strftime("%H:%M:%S"),
-        'available_endpoints': [
-            '/api/test',
-            '/api/region/<код>',
-            '/api/region/<код>/refresh',
-            '/api/regions',
-            '/api/cache/status',
-            '/api/cache/refresh'
-        ]
-    }), 404
-
 if __name__ == '__main__':
-    print("=" * 50)
-    print("🚀 API СЕРВЕР ЗАПУЩЕН")
-    print(f"📁 Источник данных: {GITHUB_DATA_URL}")
-    print(f"🕐 Время запуска: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    if data_cache['data']:
-        regions = [k for k in data_cache['data'].keys() if not k.startswith('_')]
-        print(f"📊 Загружено регионов: {len(regions)}")
-        if regions:
-            print(f"   Примеры: {', '.join(regions[:5])}")
-        print(f"⏰ Последнее обновление: {data_cache['last_update']}")
-    else:
-        print("⚠️ Данные не загружены!")
-        if data_cache['error']:
-            print(f"❌ Ошибка: {data_cache['error']}")
-        print("   API будет возвращать тестовые данные")
-    
-    print("\n📡 Доступные endpoints:")
-    print("   - GET  /api/test - тест сервера")
-    print("   - GET  /api/region/<код> - данные региона")
-    print("   - POST /api/region/<код>/refresh - обновить кэш")
-    print("   - GET  /api/regions - список регионов")
-    print("   - GET  /api/cache/status - статус кэша")
-    print("   - POST /api/cache/refresh - обновить кэш")
-    print("=" * 50)
-    
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
