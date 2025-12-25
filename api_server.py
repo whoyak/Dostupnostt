@@ -210,6 +210,7 @@ def get_historical_data(region_code, timestamp):
                 pass
             
             closest_item = None
+            closest_item_time = None
             if target_time:
                 for item in history_response['history']:
                     item_time = datetime.fromisoformat(item.get('full_timestamp', '2000-01-01').replace('Z', '+00:00'))
@@ -343,3 +344,4 @@ def health_check():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
+
