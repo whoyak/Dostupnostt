@@ -19,6 +19,8 @@ CORS(app)  # Разрешаем CORS для всех доменов
 # Эти настройки нужны для доменной авторизации
 LDAP_GATEWAY_ENABLED = True  # Включить доменную авторизацию через GitHub
 GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN', '')  # Токен для GitHub API
+LDAP_GATEWAY_URL = "http://localhost:8080"  # Или URL вашего ldap_gateway_working.py
+LDAP_GATEWAY_TIMEOUT = 5
 GITHUB_REPO = "whoyak/region-data-cache"
 GITHUB_BRANCH = "main"
 
@@ -272,9 +274,10 @@ def get_historical_data(region_code, timestamp):
             'timestamp': timestamp
         }), 500
 
+
 @app.route('/api/auth/login', methods=['POST'])
 def auth_login():
-    """Аутентификация через GitHub файлы (LDAP Gateway)"""
+    """Аутентификация через LDAP Gateway"""
     try:
         data = request.json
         username = data.get('username', '').strip()
@@ -285,82 +288,27 @@ def auth_login():
 
         print(f"🔐 Auth request for: {username}")
 
-        # 1. Проверяем фолбэк пользователей (для быстрой проверки)
-        if username in FALLBACK_USERS and FALLBACK_USERS[username] == password:
-            print(f"✅ Fallback auth successful for {username}")
-            return jsonify({
-                'success': True,
-                'username': username,
-                'display_name': username,
-                'auth_source': 'fallback',
-                'timestamp': datetime.now().isoformat(),
-                'warning': 'Using fallback authentication'
-            })
+        # Отправляем запрос в LDAP Gateway
+        try:
+            response = requests.post(
+                f"{LDAP_GATEWAY_URL}/api/auth/login",  # Убедитесь что в gateway есть этот endpoint
+                json={'username': username, 'password': password},
+                timeout=LDAP_GATEWAY_TIMEOUT
+            )
 
-        # 2. Если LDAP Gateway включен, используем его
-        if LDAP_GATEWAY_ENABLED and GITHUB_TOKEN:
-            print(f"📡 Using LDAP Gateway via GitHub")
+            if response.status_code == 200:
+                return jsonify(response.json())
+            else:
+                print(f"⚠️ LDAP gateway error: {response.status_code}")
 
-            # Создаем запрос для LDAP Gateway
-            request_id = str(uuid.uuid4())[:8]
-            auth_request = {
-                'request_id': request_id,
-                'username': username,
-                'password': password,  # ⚠️ Внимание: пароль в открытом виде!
-                'created_at': datetime.now().isoformat(),
-                'source_ip': request.remote_addr,
-                'processed': False
-            }
+        except Exception as e:
+            print(f"❌ LDAP gateway exception: {str(e)}")
 
-            try:
-                # Загружаем текущие запросы с GitHub
-                url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/ldap_requests.json"
-                headers = {
-                    'Authorization': f'token {GITHUB_TOKEN}',
-                    'Accept': 'application/vnd.github.v3+json'
-                }
-
-                response = requests.get(url, headers=headers, timeout=10)
-                current_requests = []
-                sha = None
-
-                if response.status_code == 200:
-                    content = base64.b64decode(response.json()['content']).decode('utf-8')
-                    current_requests = json.loads(content)
-                    sha = response.json()['sha']
-
-                # Добавляем новый запрос
-                current_requests.append(auth_request)
-
-                # Сохраняем обратно на GitHub
-                content_encoded = base64.b64encode(
-                    json.dumps(current_requests, indent=2).encode('utf-8')
-                ).decode('utf-8')
-
-                payload = {
-                    'message': f'Auth request: {username}',
-                    'content': content_encoded,
-                    'branch': GITHUB_BRANCH
-                }
-                if sha:
-                    payload['sha'] = sha
-
-                put_response = requests.put(url, headers=headers, json=payload, timeout=10)
-
-                if put_response.status_code in [200, 201]:
-                    print(f"📝 Запрос {request_id} отправлен в очередь LDAP Gateway")
-                else:
-                    print(f"⚠️ Ошибка сохранения запроса: {put_response.status_code}")
-
-            except Exception as e:
-                print(f"⚠️ Ошибка работы с GitHub API: {str(e)}")
-
-        # 3. Все методы не сработали
-        print(f"❌ Все auth методы failed для {username}")
+        # Если LDAP не сработал
         return jsonify({
             'success': False,
-            'error': 'Invalid credentials',
-            'tried_ldap': LDAP_GATEWAY_ENABLED
+            'error': 'Не удалось проверить учетные данные. Проверьте подключение к корпоративной сети.',
+            'timestamp': datetime.now().isoformat()
         }), 401
 
     except Exception as e:
