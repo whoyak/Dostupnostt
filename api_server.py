@@ -184,6 +184,24 @@ def get_region_history(region_code):
             'region_code': region_code
         }), 500
 
+@app.route('/api/auth/health', methods=['GET'])
+def auth_health():
+    """Проверка доступности доменной авторизации"""
+    try:
+        response = requests.get(
+            f"{LDAP_GATEWAY_URL}/api/ldap/health",
+            headers={'X-API-Key': LDAP_GATEWAY_KEY},
+            timeout=5
+        )
+        return jsonify(response.json())
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'ldap_available': False,
+            'error': str(e),
+            'timestamp': datetime.now().isoformat()
+        }), 503
+
 @app.route('/api/region/<region_code>/history/<timestamp>', methods=['GET'])
 def get_historical_data(region_code, timestamp):
     """Получение данных региона на конкретный момент времени"""
@@ -258,6 +276,54 @@ def get_historical_data(region_code, timestamp):
             'error': str(e),
             'region_code': region_code,
             'timestamp': timestamp
+        }), 500
+
+@app.route('/api/auth/login', methods=['POST'])
+def auth_login():
+    """Прокси для аутентификации через LDAP Gateway"""
+    try:
+        # 1. Получаем учетные данные из запроса
+        data = request.json
+        username = data.get('username', '').strip()
+        password = data.get('password', '').strip()
+        
+        if not username or not password:
+            return jsonify({'success': False, 'error': 'Missing credentials'}), 400
+        
+        # 2. Отправляем запрос во внутренний LDAP Gateway
+        ldap_response = requests.post(
+            f"{LDAP_GATEWAY_URL}/api/ldap/authenticate",
+            json={'username': username, 'password': password},
+            headers={'X-API-Key': LDAP_GATEWAY_KEY},
+            timeout=10
+        )
+        
+        # 3. Возвращаем ответ от LDAP (или кэшируем сессию)
+        if ldap_response.status_code == 200:
+            ldap_data = ldap_response.json()
+            
+            # Здесь можно создать сессию/JWT токен для пользователя
+            # Пока просто возвращаем ответ от LDAP
+            
+            return jsonify(ldap_data)
+        else:
+            # Проксируем ошибку от LDAP Gateway
+            return jsonify({
+                'success': False,
+                'error': 'Authentication failed',
+                'details': ldap_response.json() if ldap_response.content else 'LDAP gateway error'
+            }), ldap_response.status_code
+            
+    except requests.exceptions.Timeout:
+        return jsonify({
+            'success': False,
+            'error': 'LDAP service timeout',
+            'fallback': 'using_local_auth'  # Можно переключиться на локальную
+        }), 504
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': f'Auth service error: {str(e)}'
         }), 500
 
 @app.route('/api/region/<region_code>/refresh', methods=['POST'])
@@ -348,5 +414,6 @@ def health_check():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
+
 
 
