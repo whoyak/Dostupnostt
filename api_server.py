@@ -269,6 +269,108 @@ def get_historical_data(region_code, timestamp):
             'timestamp': timestamp
         }), 500
 
+
+# Добавьте этот endpoint
+@app.route('/api/auth/login', methods=['POST'])
+def auth_login_github():
+    """Аутентификация через GitHub файлы"""
+    try:
+        data = request.json
+        username = data.get('username', '').strip()
+        password = data.get('password', '').strip()
+
+        if not username or not password:
+            return jsonify({'success': False, 'error': 'Missing credentials'}), 400
+
+        import uuid
+        import time
+
+        # 1. Создаем запрос
+        request_id = str(uuid.uuid4())[:8]
+        auth_request = {
+            'request_id': request_id,
+            'username': username,
+            'password': password,  # ⚠️ Лучше шифровать!
+            'created_at': datetime.now().isoformat(),
+            'source_ip': request.remote_addr,
+            'processed': False
+        }
+
+        # 2. Загружаем текущие запросы
+        github_url = "https://api.github.com/repos/whoyak/region-data-cache/contents/ldap_requests.json"
+        headers = {
+            'Authorization': f'token ваш_токен',
+            'Accept': 'application/vnd.github.v3+json'
+        }
+
+        response = requests.get(github_url, headers=headers)
+        current_requests = []
+        sha = None
+
+        if response.status_code == 200:
+            import base64
+            content = base64.b64decode(response.json()['content']).decode('utf-8')
+            current_requests = json.loads(content)
+            sha = response.json()['sha']
+
+        # 3. Добавляем новый запрос
+        current_requests.append(auth_request)
+
+        # 4. Сохраняем обратно на GitHub
+        content_encoded = base64.b64encode(
+            json.dumps(current_requests, indent=2).encode('utf-8')
+        ).decode('utf-8')
+
+        payload = {
+            'message': f'Auth request: {username}',
+            'content': content_encoded,
+            'branch': 'main'
+        }
+        if sha:
+            payload['sha'] = sha
+
+        requests.put(github_url, headers=headers, json=payload)
+
+        print(f"📝 Запрос {request_id} отправлен в очередь")
+
+        # 5. Ждем результат (опрашиваем results.json)
+        for i in range(20):  # 20 попыток по 3 секунды = 60 секунд
+            time.sleep(3)
+
+            results_url = "https://raw.githubusercontent.com/whoyak/region-data-cache/main/ldap_results.json"
+            results_response = requests.get(results_url)
+
+            if results_response.status_code == 200:
+                results = results_response.json()
+
+                # Ищем наш результат
+                for result in results:
+                    if result.get('request_id') == request_id:
+                        if result.get('success'):
+                            return jsonify({
+                                'success': True,
+                                'username': username,
+                                'display_name': result.get('user_info', {}).get('display_name', username),
+                                'auth_source': 'ldap',
+                                'timestamp': datetime.now().isoformat()
+                            })
+                        else:
+                            return jsonify({
+                                'success': False,
+                                'error': result.get('message', 'Authentication failed'),
+                                'request_id': request_id
+                            }), 401
+
+        return jsonify({
+            'success': False,
+            'error': 'Timeout waiting for LDAP response',
+            'request_id': request_id
+        }), 408
+
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/region/<region_code>/refresh', methods=['POST'])
 def refresh_region_data(region_code):
     """Принудительное обновление данных региона"""
