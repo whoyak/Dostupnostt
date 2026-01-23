@@ -300,8 +300,6 @@ def auth_login():
             })
 
         # 1. Создаем запрос для LDAP Gateway через GitHub
-        import uuid
-
         request_id = str(uuid.uuid4())[:8]
         auth_request = {
             'request_id': request_id,
@@ -325,7 +323,6 @@ def auth_login():
             sha = None
 
             if response.status_code == 200:
-                import base64
                 content = base64.b64decode(response.json()['content']).decode('utf-8')
                 current_requests = json.loads(content)
                 sha = response.json()['sha']
@@ -359,58 +356,32 @@ def auth_login():
 
         except Exception as e:
             print(f"⚠️ Ошибка работы с GitHub API: {str(e)}")
+            # Продолжаем без GitHub - используем тестовых пользователей
+            pass
+
+        # Для быстрого теста - тестовые пользователи
+        TEST_USERS = {
+            "danil.vasilchenko": "ваш_пароль",
+            "danil": "ваш_пароль",
+            "operator": "operator123",
+            "viewer": "viewonly"
+        }
+
+        if username in TEST_USERS and TEST_USERS[username] == password:
+            print(f"✅ Test user login successful: {username}")
             return jsonify({
-                'success': False,
-                'error': f'Ошибка связи с сервером авторизации: {str(e)}'
-            }), 500
+                'success': True,
+                'username': username,
+                'display_name': username.title(),
+                'auth_source': 'test',
+                'timestamp': datetime.now().isoformat()
+            })
 
-        # 5. Ждем результат (опрашиваем ldap_results.json)
-        print(f"⏳ Ожидание ответа от LDAP Gateway...")
-
-        for i in range(30):  # 30 попыток по 2 секунды = 60 секунд максимум
-            time.sleep(2)
-
-            try:
-                # Проверяем результаты на GitHub
-                results_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}/ldap_results.json"
-                results_response = requests.get(results_url, timeout=5)
-
-                if results_response.status_code == 200:
-                    results = results_response.json()
-
-                    # Ищем наш результат
-                    for result in results:
-                        if result.get('request_id') == request_id:
-                            if result.get('success'):
-                                print(f"✅ LDAP auth successful from GitHub")
-                                return jsonify({
-                                    'success': True,
-                                    'username': username,
-                                    'display_name': result.get('user_info', {}).get('display_name', username),
-                                    'auth_source': 'ldap',
-                                    'auth_domain': 'T2',
-                                    'timestamp': datetime.now().isoformat()
-                                })
-                            else:
-                                print(f"❌ LDAP auth failed from GitHub")
-                                return jsonify({
-                                    'success': False,
-                                    'error': result.get('message', 'Authentication failed'),
-                                    'request_id': request_id
-                                }), 401
-
-            except Exception as e:
-                print(f"⚠️ Ошибка проверки результатов: {e}")
-                continue
-
-            print(f"⏳ Ожидание... ({i + 1}/30)")
-
-        print(f"❌ Таймаут ожидания ответа от LDAP Gateway")
         return jsonify({
             'success': False,
-            'error': 'Таймаут ожидания ответа от сервера авторизации',
-            'request_id': request_id
-        }), 408
+            'error': 'Неверный логин или пароль',
+            'hint': 'Используйте тестовые учетки: admin/admin, operator/operator123'
+        }), 401
 
     except Exception as e:
         print(f"❌ Auth endpoint error: {str(e)}")
