@@ -9,22 +9,25 @@ import json
 import requests
 from datetime import datetime, timedelta
 import os
+import base64
+import uuid
 
 app = Flask(__name__)
 CORS(app)  # Разрешаем CORS для всех доменов
 
 # === LDAP GATEWAY КОНФИГУРАЦИЯ ===
 # Эти настройки нужны для доменной авторизации
-LDAP_GATEWAY_ENABLED = True  # Включить доменную авторизацию
-LDAP_GATEWAY_URL = "http://localhost:8080"  # Будет заменено на ngrok URL
-LDAP_GATEWAY_KEY = "test-key-123"  # Должен совпадать с ключом в ldap_gateway.py
-LDAP_GATEWAY_TIMEOUT = 5  # Таймаут в секундах
+LDAP_GATEWAY_ENABLED = True  # Включить доменную авторизацию через GitHub
+GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN', '')  # Токен для GitHub API
+GITHUB_REPO = "whoyak/region-data-cache"
+GITHUB_BRANCH = "main"
 
 # Фолбэк пользователи (если LDAP недоступен)
 FALLBACK_USERS = {
     "operator": "operator123",
     "viewer": "viewonly",
-    "test": "test123"
+    "test": "test123",
+    "admin": "admin"  # Добавил для тестирования
 }
 
 # Конфигурация
@@ -269,11 +272,9 @@ def get_historical_data(region_code, timestamp):
             'timestamp': timestamp
         }), 500
 
-
-# Добавьте этот endpoint
 @app.route('/api/auth/login', methods=['POST'])
-def auth_login_github():
-    """Аутентификация через GitHub файлы"""
+def auth_login():
+    """Аутентификация через GitHub файлы (LDAP Gateway)"""
     try:
         data = request.json
         username = data.get('username', '').strip()
@@ -282,94 +283,121 @@ def auth_login_github():
         if not username or not password:
             return jsonify({'success': False, 'error': 'Missing credentials'}), 400
 
-        import uuid
-        import time
+        print(f"🔐 Auth request for: {username}")
 
-        # 1. Создаем запрос
-        request_id = str(uuid.uuid4())[:8]
-        auth_request = {
-            'request_id': request_id,
-            'username': username,
-            'password': password,  # ⚠️ Лучше шифровать!
-            'created_at': datetime.now().isoformat(),
-            'source_ip': request.remote_addr,
-            'processed': False
-        }
+        # 1. Проверяем фолбэк пользователей (для быстрой проверки)
+        if username in FALLBACK_USERS and FALLBACK_USERS[username] == password:
+            print(f"✅ Fallback auth successful for {username}")
+            return jsonify({
+                'success': True,
+                'username': username,
+                'display_name': username,
+                'auth_source': 'fallback',
+                'timestamp': datetime.now().isoformat(),
+                'warning': 'Using fallback authentication'
+            })
 
-        # 2. Загружаем текущие запросы
-        github_url = "https://api.github.com/repos/whoyak/region-data-cache/contents/ldap_requests.json"
-        headers = {
-            'Authorization': f'token ваш_токен',
-            'Accept': 'application/vnd.github.v3+json'
-        }
+        # 2. Если LDAP Gateway включен, используем его
+        if LDAP_GATEWAY_ENABLED and GITHUB_TOKEN:
+            print(f"📡 Using LDAP Gateway via GitHub")
 
-        response = requests.get(github_url, headers=headers)
-        current_requests = []
-        sha = None
+            # Создаем запрос для LDAP Gateway
+            request_id = str(uuid.uuid4())[:8]
+            auth_request = {
+                'request_id': request_id,
+                'username': username,
+                'password': password,  # ⚠️ Внимание: пароль в открытом виде!
+                'created_at': datetime.now().isoformat(),
+                'source_ip': request.remote_addr,
+                'processed': False
+            }
 
-        if response.status_code == 200:
-            import base64
-            content = base64.b64decode(response.json()['content']).decode('utf-8')
-            current_requests = json.loads(content)
-            sha = response.json()['sha']
+            try:
+                # Загружаем текущие запросы с GitHub
+                url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/ldap_requests.json"
+                headers = {
+                    'Authorization': f'token {GITHUB_TOKEN}',
+                    'Accept': 'application/vnd.github.v3+json'
+                }
 
-        # 3. Добавляем новый запрос
-        current_requests.append(auth_request)
+                response = requests.get(url, headers=headers, timeout=10)
+                current_requests = []
+                sha = None
 
-        # 4. Сохраняем обратно на GitHub
-        content_encoded = base64.b64encode(
-            json.dumps(current_requests, indent=2).encode('utf-8')
-        ).decode('utf-8')
+                if response.status_code == 200:
+                    content = base64.b64decode(response.json()['content']).decode('utf-8')
+                    current_requests = json.loads(content)
+                    sha = response.json()['sha']
 
-        payload = {
-            'message': f'Auth request: {username}',
-            'content': content_encoded,
-            'branch': 'main'
-        }
-        if sha:
-            payload['sha'] = sha
+                # Добавляем новый запрос
+                current_requests.append(auth_request)
 
-        requests.put(github_url, headers=headers, json=payload)
+                # Сохраняем обратно на GitHub
+                content_encoded = base64.b64encode(
+                    json.dumps(current_requests, indent=2).encode('utf-8')
+                ).decode('utf-8')
 
-        print(f"📝 Запрос {request_id} отправлен в очередь")
+                payload = {
+                    'message': f'Auth request: {username}',
+                    'content': content_encoded,
+                    'branch': GITHUB_BRANCH
+                }
+                if sha:
+                    payload['sha'] = sha
 
-        # 5. Ждем результат (опрашиваем results.json)
-        for i in range(20):  # 20 попыток по 3 секунды = 60 секунд
-            time.sleep(3)
+                put_response = requests.put(url, headers=headers, json=payload, timeout=10)
 
-            results_url = "https://raw.githubusercontent.com/whoyak/region-data-cache/main/ldap_results.json"
-            results_response = requests.get(results_url)
+                if put_response.status_code in [200, 201]:
+                    print(f"📝 Запрос {request_id} отправлен в очередь LDAP Gateway")
+                else:
+                    print(f"⚠️ Ошибка сохранения запроса: {put_response.status_code}")
 
-            if results_response.status_code == 200:
-                results = results_response.json()
+            except Exception as e:
+                print(f"⚠️ Ошибка работы с GitHub API: {str(e)}")
 
-                # Ищем наш результат
-                for result in results:
-                    if result.get('request_id') == request_id:
-                        if result.get('success'):
-                            return jsonify({
-                                'success': True,
-                                'username': username,
-                                'display_name': result.get('user_info', {}).get('display_name', username),
-                                'auth_source': 'ldap',
-                                'timestamp': datetime.now().isoformat()
-                            })
-                        else:
-                            return jsonify({
-                                'success': False,
-                                'error': result.get('message', 'Authentication failed'),
-                                'request_id': request_id
-                            }), 401
-
+        # 3. Все методы не сработали
+        print(f"❌ Все auth методы failed для {username}")
         return jsonify({
             'success': False,
-            'error': 'Timeout waiting for LDAP response',
-            'request_id': request_id
-        }), 408
+            'error': 'Invalid credentials',
+            'tried_ldap': LDAP_GATEWAY_ENABLED
+        }), 401
 
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        print(f"❌ Auth endpoint error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Authentication error: {str(e)}'
+        }), 500
 
+@app.route('/api/auth/health', methods=['GET'])
+def auth_health():
+    """Проверка доступности авторизации"""
+    ldap_status = 'unknown'
+
+    try:
+        # Проверяем статус LDAP Gateway через GitHub
+        status_url = f"{GITHUB_RAW_BASE}ldap_status.json"
+        response = requests.get(status_url, timeout=5)
+
+        if response.status_code == 200:
+            status_data = response.json()
+            ldap_status = status_data.get('status', 'unknown')
+        else:
+            ldap_status = 'unavailable'
+    except:
+        ldap_status = 'unavailable'
+
+    return jsonify({
+        'success': True,
+        'ldap_gateway': {
+            'enabled': LDAP_GATEWAY_ENABLED,
+            'status': ldap_status,
+            'method': 'github_files'
+        },
+        'fallback_users': len(FALLBACK_USERS),
+        'timestamp': datetime.now().isoformat()
+    })
 
 @app.route('/api/region/<region_code>/refresh', methods=['POST'])
 def refresh_region_data(region_code):
@@ -455,122 +483,6 @@ def health_check():
         'service': 'dostupnost-api',
         'features': ['current_data', 'historical_data', 'full_history']
     })
-
-
-# === LDAP АВТОРИЗАЦИЯ ===
-
-@app.route('/api/auth/login', methods=['POST'])
-def auth_login():
-    """Аутентификация через LDAP Gateway"""
-    try:
-        data = request.json
-        username = data.get('username', '').strip()
-        password = data.get('password', '').strip()
-
-        if not username or not password:
-            return jsonify({'success': False, 'error': 'Missing credentials'}), 400
-
-        print(f"🔐 Auth request for: {username}")
-
-        # 1. Сначала пробуем LDAP Gateway
-        if LDAP_GATEWAY_ENABLED:
-            try:
-                print(f"📡 Trying LDAP gateway: {LDAP_GATEWAY_URL}")
-
-                ldap_response = requests.post(
-                    f"{LDAP_GATEWAY_URL}/api/ldap/authenticate",
-                    json={'username': username, 'password': password},
-                    headers={'X-API-Key': LDAP_GATEWAY_KEY},
-                    timeout=LDAP_GATEWAY_TIMEOUT
-                )
-
-                if ldap_response.status_code == 200:
-                    ldap_data = ldap_response.json()
-
-                    if ldap_data.get('success'):
-                        print(f"✅ LDAP auth successful for {username}")
-
-                        # Расширяем ответ информацией из LDAP
-                        return jsonify({
-                            'success': True,
-                            'username': username,
-                            'display_name': ldap_data.get('display_name', username),
-                            'auth_source': 'ldap',
-                            'auth_domain': ldap_data.get('auth_domain', 'T2'),
-                            'timestamp': datetime.now().isoformat()
-                        })
-
-                    print(f"⚠️ LDAP auth failed: {ldap_data.get('error')}")
-
-                else:
-                    print(f"⚠️ LDAP gateway error: {ldap_response.status_code}")
-
-            except requests.exceptions.Timeout:
-                print("⏰ LDAP gateway timeout")
-            except requests.exceptions.ConnectionError:
-                print("🔌 LDAP gateway connection error")
-            except Exception as e:
-                print(f"❌ LDAP gateway exception: {str(e)}")
-
-        # 2. Если LDAP недоступен - проверяем фолбэк пользователей
-        print(f"🔄 Falling back to local auth for {username}")
-
-        if username in FALLBACK_USERS and FALLBACK_USERS[username] == password:
-            print(f"✅ Fallback auth successful")
-            return jsonify({
-                'success': True,
-                'username': username,
-                'display_name': username,
-                'auth_source': 'fallback',
-                'timestamp': datetime.now().isoformat(),
-                'warning': 'Using fallback authentication (LDAP unavailable)'
-            })
-
-        # 3. Все методы не сработали
-        print(f"❌ All auth methods failed for {username}")
-        return jsonify({
-            'success': False,
-            'error': 'Invalid credentials',
-            'tried_ldap': LDAP_GATEWAY_ENABLED
-        }), 401
-
-    except Exception as e:
-        print(f"❌ Auth endpoint error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': f'Authentication error: {str(e)}'
-        }), 500
-
-
-@app.route('/api/auth/health', methods=['GET'])
-def auth_health():
-    """Проверка доступности авторизации"""
-    ldap_status = 'unknown'
-
-    if LDAP_GATEWAY_ENABLED:
-        try:
-            response = requests.get(
-                f"{LDAP_GATEWAY_URL}/api/ldap/health",
-                headers={'X-API-Key': LDAP_GATEWAY_KEY},
-                timeout=3
-            )
-            ldap_status = 'available' if response.status_code == 200 else 'unavailable'
-        except:
-            ldap_status = 'unavailable'
-
-    return jsonify({
-        'success': True,
-        'ldap_gateway': {
-            'enabled': LDAP_GATEWAY_ENABLED,
-            'status': ldap_status,
-            'url': LDAP_GATEWAY_URL
-        },
-        'fallback_users': len(FALLBACK_USERS),
-        'timestamp': datetime.now().isoformat()
-    })
-
-
-
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
