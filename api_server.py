@@ -18,7 +18,7 @@ CORS(app)  # Разрешаем CORS для всех доменов
 # === LDAP GATEWAY КОНФИГУРАЦИЯ ===
 # Эти настройки нужны для доменной авторизации
 LDAP_GATEWAY_ENABLED = True  # Включить доменную авторизацию через GitHub
-GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN', '')  # Токен для GitHub API
+GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')  # Токен для GitHub API
 LDAP_GATEWAY_URL = "http://localhost:8080"  # Или URL вашего ldap_gateway_working.py
 LDAP_GATEWAY_TIMEOUT = 5
 GITHUB_REPO = "whoyak/region-data-cache"
@@ -507,4 +507,5 @@ def health_check():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
+
 
