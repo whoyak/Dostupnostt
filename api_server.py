@@ -2,7 +2,7 @@
 API СЕРВЕР ДЛЯ ДОСТУПНОСТИ РЕГИОНОВ С ИСТОРИЧЕСКИМИ ДАННЫМИ
 Запускается на Render.com
 """
-
+import time
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import json
@@ -277,7 +277,7 @@ def get_historical_data(region_code, timestamp):
 
 @app.route('/api/auth/login', methods=['POST'])
 def auth_login():
-    """Аутентификация через LDAP Gateway"""
+    """Аутентификация через GitHub файлы (LDAP Gateway)"""
     try:
         data = request.json
         username = data.get('username', '').strip()
@@ -288,28 +288,129 @@ def auth_login():
 
         print(f"🔐 Auth request for: {username}")
 
-        # Отправляем запрос в LDAP Gateway
+        # Для быстрого теста - админ
+        if username.lower() == 'admin' and password == 'admin':
+            print(f"✅ Admin login (test)")
+            return jsonify({
+                'success': True,
+                'username': 'admin',
+                'display_name': 'Администратор',
+                'auth_source': 'test',
+                'timestamp': datetime.now().isoformat()
+            })
+
+        # 1. Создаем запрос для LDAP Gateway через GitHub
+        import uuid
+
+        request_id = str(uuid.uuid4())[:8]
+        auth_request = {
+            'request_id': request_id,
+            'username': username,
+            'password': password,  # ⚠️ В открытом виде - нужно шифровать!
+            'created_at': datetime.now().isoformat(),
+            'source_ip': request.remote_addr,
+            'processed': False
+        }
+
         try:
-            response = requests.post(
-                f"{LDAP_GATEWAY_URL}/api/auth/login",  # Убедитесь что в gateway есть этот endpoint
-                json={'username': username, 'password': password},
-                timeout=LDAP_GATEWAY_TIMEOUT
-            )
+            # 2. Загружаем текущие запросы с GitHub
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/ldap_requests.json"
+            headers = {
+                'Authorization': f'token {GITHUB_TOKEN}',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+
+            response = requests.get(url, headers=headers, timeout=10)
+            current_requests = []
+            sha = None
 
             if response.status_code == 200:
-                return jsonify(response.json())
+                import base64
+                content = base64.b64decode(response.json()['content']).decode('utf-8')
+                current_requests = json.loads(content)
+                sha = response.json()['sha']
+
+            # 3. Добавляем новый запрос
+            current_requests.append(auth_request)
+
+            # 4. Сохраняем обратно на GitHub
+            content_encoded = base64.b64encode(
+                json.dumps(current_requests, indent=2).encode('utf-8')
+            ).decode('utf-8')
+
+            payload = {
+                'message': f'Auth request: {username}',
+                'content': content_encoded,
+                'branch': GITHUB_BRANCH
+            }
+            if sha:
+                payload['sha'] = sha
+
+            put_response = requests.put(url, headers=headers, json=payload, timeout=10)
+
+            if put_response.status_code in [200, 201]:
+                print(f"📝 Запрос {request_id} отправлен в очередь LDAP Gateway")
             else:
-                print(f"⚠️ LDAP gateway error: {response.status_code}")
+                print(f"⚠️ Ошибка сохранения запроса: {put_response.status_code}")
+                return jsonify({
+                    'success': False,
+                    'error': 'Не удалось отправить запрос авторизации'
+                }), 500
 
         except Exception as e:
-            print(f"❌ LDAP gateway exception: {str(e)}")
+            print(f"⚠️ Ошибка работы с GitHub API: {str(e)}")
+            return jsonify({
+                'success': False,
+                'error': f'Ошибка связи с сервером авторизации: {str(e)}'
+            }), 500
 
-        # Если LDAP не сработал
+        # 5. Ждем результат (опрашиваем ldap_results.json)
+        print(f"⏳ Ожидание ответа от LDAP Gateway...")
+
+        for i in range(30):  # 30 попыток по 2 секунды = 60 секунд максимум
+            time.sleep(2)
+
+            try:
+                # Проверяем результаты на GitHub
+                results_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}/ldap_results.json"
+                results_response = requests.get(results_url, timeout=5)
+
+                if results_response.status_code == 200:
+                    results = results_response.json()
+
+                    # Ищем наш результат
+                    for result in results:
+                        if result.get('request_id') == request_id:
+                            if result.get('success'):
+                                print(f"✅ LDAP auth successful from GitHub")
+                                return jsonify({
+                                    'success': True,
+                                    'username': username,
+                                    'display_name': result.get('user_info', {}).get('display_name', username),
+                                    'auth_source': 'ldap',
+                                    'auth_domain': 'T2',
+                                    'timestamp': datetime.now().isoformat()
+                                })
+                            else:
+                                print(f"❌ LDAP auth failed from GitHub")
+                                return jsonify({
+                                    'success': False,
+                                    'error': result.get('message', 'Authentication failed'),
+                                    'request_id': request_id
+                                }), 401
+
+            except Exception as e:
+                print(f"⚠️ Ошибка проверки результатов: {e}")
+                continue
+
+            print(f"⏳ Ожидание... ({i + 1}/30)")
+
+        print(f"❌ Таймаут ожидания ответа от LDAP Gateway")
         return jsonify({
             'success': False,
-            'error': 'Не удалось проверить учетные данные. Проверьте подключение к корпоративной сети.',
-            'timestamp': datetime.now().isoformat()
-        }), 401
+            'error': 'Таймаут ожидания ответа от сервера авторизации',
+            'request_id': request_id
+        }), 408
 
     except Exception as e:
         print(f"❌ Auth endpoint error: {str(e)}")
