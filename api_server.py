@@ -1,20 +1,16 @@
 """
 🌐 API СЕРВЕР ДЛЯ ANDROID ПРИЛОЖЕНИЯ
-Запускается на Render.com, подключается к локальному LDAP серверу в сети t2
+Запускается на Render.com, берет данные из GitHub
 """
 
 import os
 import requests
 import logging
 import json
-from datetime import datetime
+import base64
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from functools import wraps
-import urllib3
-
-# Отключаем предупреждения о самоподписанных сертификатах
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ================== НАСТРОЙКА ЛОГГИНГА ==================
 
@@ -32,527 +28,523 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 class Config:
     """Конфигурация из переменных окружения Render.com"""
     
-    # 🔐 URL вашего локального LDAP сервера (самое важное!)
-    LDAP_SERVER_URL = os.environ.get('LDAP_SERVER_URL', '')
-    # Формат: https://ВАШ_ВНЕШНИЙ_IP:8443/api/ldap/auth
-    # Пример: https://95.165.123.456:8443/api/ldap/auth
+    # 🔗 GitHub репозиторий с данными
+    GITHUB_REPO = os.environ.get('GITHUB_REPO', 'whoyak/region-data-cache')
+    GITHUB_BRANCH = os.environ.get('GITHUB_BRANCH', 'main')
     
-    # 📊 Данные регионов (опционально)
-    DATA_API_URL = os.environ.get('DATA_API_URL', '')
+    # 🔑 GitHub токен (для большего лимита запросов, необязательно)
+    GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN', '')
     
     # ⚙️ Настройки запросов
-    REQUEST_TIMEOUT = int(os.environ.get('REQUEST_TIMEOUT', 15))  # Увеличил таймаут
-    VERIFY_SSL = os.environ.get('VERIFY_SSL', 'false').lower() == 'true'
+    REQUEST_TIMEOUT = int(os.environ.get('REQUEST_TIMEOUT', 10))
+    CACHE_TIMEOUT = int(os.environ.get('CACHE_TIMEOUT', 300))  # кеширование 5 минут
     
-    # 🔧 Фолбэк режим (если LDAP недоступен)
-    FALLBACK_MODE = os.environ.get('FALLBACK_MODE', 'true').lower() == 'true'
+    # 🔧 Прямой доступ к GitHub API (если нужна история через API)
+    USE_GITHUB_API = os.environ.get('USE_GITHUB_API', 'false').lower() == 'true'
     
-    # 📝 Тестовые пользователи для фолбэка
-    FALLBACK_USERS = {
-        'admin': 'admin123',
-        'test@t2.ru': 'Test123!',
-        'danil.vasilchenko@t2.ru': 'Daniil2024!',
-        'user@t2.ru': 'User123!'
+    # 📋 Список доступных регионов
+    AVAILABLE_REGIONS = [
+        'BRT', 'IRK', 'KAM', 'KHB', 'SAH', 'VLD', 'BIR', 'AND', 'MGD', 'CHV',
+        'IZH', 'KAZ', 'NIN', 'SAM', 'YOL', 'KIR', 'ULN', 'CNT', 'NEA', 'NWS',
+        'SEA', 'SWS', 'ARH', 'KLN', 'MUR', 'NOV', 'PSK', 'PZV', 'SPE', 'SPN',
+        'SPS', 'SPW', 'VOL', 'NEN', 'BRN', 'KHA', 'KRS', 'NSK', 'OMS', 'TYV',
+        'GRN', 'KEM', 'TOM', 'CHE', 'EKT', 'HAN', 'KOM', 'ORB', 'PRM', 'TUM',
+        'YNR', 'KRG', 'UFA', 'IVN', 'KLG', 'KOS', 'RYZ', 'SMO', 'TUL', 'TVE',
+        'VLA', 'YRL', 'BEL', 'BRY', 'KUR', 'LIP', 'MRD', 'ORL', 'PNZ', 'SRV',
+        'TAM', 'VRN', 'KRA', 'ROS', 'STV', 'VLG'
+    ]
+
+# ================== КЕШИРОВАНИЕ ==================
+
+class DataCache:
+    """Простой кеш для данных GitHub"""
+    
+    _cache = {}
+    
+    @classmethod
+    def get(cls, key):
+        """Получить данные из кеша"""
+        if key in cls._cache:
+            data, timestamp = cls._cache[key]
+            if datetime.now() - timestamp < timedelta(seconds=Config.CACHE_TIMEOUT):
+                logger.debug(f"📦 Данные из кеша: {key}")
+                return data
+        return None
+    
+    @classmethod
+    def set(cls, key, data):
+        """Сохранить данные в кеш"""
+        cls._cache[key] = (data, datetime.now())
+    
+    @classmethod
+    def clear(cls):
+        """Очистить кеш"""
+        cls._cache = {}
+
+# ================== GITHUB КЛИЕНТ ==================
+
+def get_github_headers():
+    """Получить заголовки для запросов к GitHub"""
+    headers = {
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'RegionDataAPI/1.0'
     }
     
-    # 📍 Фолбэк данные регионов
-    FALLBACK_REGIONS = {
-        'BRT': {
-            'region_name': 'Бурятия',
-            'base_layer': '📡 Основной слой: 142 БС\n✅ Работают: 139\n⚠️ Проблемы: 3',
-            'non_priority': '📶 Технологии: 4G-92%, 3G-8%',
-            'stats': {
-                'total_bs': 150,
-                'base_layer_count': 142,
-                'power_problems': 3,
-                'non_priority_percentage': 5
-            }
-        },
-        'OMS': {
-            'region_name': 'Омская область',
-            'base_layer': '📡 Основной слой: 215 БС\n✅ Работают: 210\n⚠️ Проблемы: 5',
-            'non_priority': '📶 Технологии: 4G-95%, 3G-5%',
-            'stats': {
-                'total_bs': 230,
-                'base_layer_count': 215,
-                'power_problems': 5,
-                'non_priority_percentage': 2
-            }
-        },
-        'TEST': {
-            'region_name': 'Тестовый регион',
-            'base_layer': '📡 Тестовые данные\n✅ Все работает\n⚠️ Нет проблем',
-            'non_priority': '📶 Технологии: 4G-100%',
-            'stats': {
-                'total_bs': 100,
-                'base_layer_count': 100,
-                'power_problems': 0,
-                'non_priority_percentage': 0
-            }
-        }
-    }
+    if Config.GITHUB_TOKEN:
+        headers['Authorization'] = f'token {Config.GITHUB_TOKEN}'
+    
+    return headers
 
-# ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
-
-def make_secure_request(url, method='GET', data=None, headers=None):
-    """
-    Безопасный HTTP запрос с поддержкой самоподписанных сертификатов
-    """
+def fetch_from_github_raw(filename):
+    """Получить данные из GitHub через raw.githubusercontent.com"""
+    cache_key = f"github_raw_{filename}"
+    
+    # Проверяем кеш
+    cached_data = DataCache.get(cache_key)
+    if cached_data:
+        return cached_data
+    
     try:
-        logger.info(f"📡 {method} запрос к: {url}")
+        url = f"https://raw.githubusercontent.com/{Config.GITHUB_REPO}/{Config.GITHUB_BRANCH}/{filename}"
         
-        request_kwargs = {
-            'timeout': Config.REQUEST_TIMEOUT,
-            'verify': Config.VERIFY_SSL,  # Важно: False для самоподписанных
-            'headers': headers or {'Content-Type': 'application/json'}
-        }
-        
-        if method.upper() == 'POST' and data:
-            request_kwargs['json'] = data
-        
-        start_time = datetime.now()
-        
-        if method.upper() == 'POST':
-            response = requests.post(url, **request_kwargs)
-        elif method.upper() == 'GET':
-            response = requests.get(url, **request_kwargs)
-        else:
-            return {'success': False, 'error': f'Неподдерживаемый метод: {method}'}
-        
-        response_time = (datetime.now() - start_time).total_seconds()
-        logger.info(f"📨 Ответ {response.status_code} за {response_time:.2f}с")
+        logger.info(f"🌐 Запрос к GitHub RAW: {filename}")
+        response = requests.get(
+            url, 
+            headers=get_github_headers(),
+            timeout=Config.REQUEST_TIMEOUT
+        )
         
         if response.status_code == 200:
-            return {
-                'success': True,
-                'data': response.json(),
-                'status_code': response.status_code,
-                'response_time': response_time
-            }
-        else:
-            return {
-                'success': False,
-                'error': f'HTTP {response.status_code}',
-                'status_code': response.status_code,
-                'response_text': response.text[:200]
-            }
+            if filename.endswith('.json'):
+                data = response.json()
+            else:
+                data = response.text
             
-    except requests.exceptions.SSLError as e:
-        logger.error(f"🔒 Ошибка SSL: {e}")
-        return {
-            'success': False,
-            'error': 'Ошибка SSL сертификата',
-            'details': 'Используйте самоподписанный сертификат или настройте verify=False'
-        }
-    except requests.exceptions.Timeout:
-        logger.error(f"⏰ Таймаут {Config.REQUEST_TIMEOUT}с")
-        return {
-            'success': False,
-            'error': f'Таймаут подключения ({Config.REQUEST_TIMEOUT}с)',
-            'details': 'LDAP сервер не ответил. Проверьте доступность и порты.'
-        }
-    except requests.exceptions.ConnectionError as e:
-        logger.error(f"🔌 Ошибка подключения: {e}")
-        return {
-            'success': False,
-            'error': 'Ошибка подключения',
-            'details': f'Не удалось подключиться к серверу. Проверьте URL и доступность.'
-        }
+            # Кешируем
+            DataCache.set(cache_key, data)
+            logger.info(f"✅ Данные получены из GitHub RAW: {filename}")
+            return data
+        else:
+            logger.warning(f"⚠️ GitHub RAW вернул {response.status_code}: {filename}")
+            return None
+            
     except Exception as e:
-        logger.error(f"❌ Ошибка запроса: {e}")
-        return {
-            'success': False,
-            'error': 'Внутренняя ошибка запроса',
-            'details': str(e)[:100]
-        }
+        logger.error(f"❌ Ошибка при запросе GitHub RAW: {filename} - {e}")
+        return None
 
-def check_fallback_credentials(username, password):
-    """Проверка учетных данных в фолбэк режиме"""
-    if username in Config.FALLBACK_USERS:
-        if Config.FALLBACK_USERS[username] == password:
-            return {
-                'success': True,
-                'username': username,
-                'display_name': username.split('@')[0] if '@' in username else username,
-                'email': username if '@' in username else f'{username}@t2.ru',
-                'department': 'Технический отдел',
-                'title': 'Пользователь системы',
-                'auth_source': 'fallback_mode'
-            }
+def fetch_from_github_api(filename):
+    """Получить данные из GitHub через API (для получения метаданных)"""
+    if not Config.USE_GITHUB_API:
+        return None
     
+    cache_key = f"github_api_{filename}"
+    
+    # Проверяем кеш
+    cached_data = DataCache.get(cache_key)
+    if cached_data:
+        return cached_data
+    
+    try:
+        url = f"https://api.github.com/repos/{Config.GITHUB_REPO}/contents/{filename}?ref={Config.GITHUB_BRANCH}"
+        
+        logger.info(f"🌐 Запрос к GitHub API: {filename}")
+        response = requests.get(
+            url, 
+            headers=get_github_headers(),
+            timeout=Config.REQUEST_TIMEOUT
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            if 'content' in data:
+                # Декодируем base64 контент
+                content = base64.b64decode(data['content']).decode('utf-8')
+                if filename.endswith('.json'):
+                    data['decoded_content'] = json.loads(content)
+                else:
+                    data['decoded_content'] = content
+            
+            # Кешируем
+            DataCache.set(cache_key, data)
+            logger.info(f"✅ Данные получены из GitHub API: {filename}")
+            return data
+        else:
+            logger.warning(f"⚠️ GitHub API вернул {response.status_code}: {filename}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка при запросе GitHub API: {filename} - {e}")
+        return None
+
+def get_region_data(region_code):
+    """Получить данные региона из GitHub"""
+    region_code = region_code.upper()
+    
+    # Пробуем получить данные из файла региона
+    region_data = fetch_from_github_raw(f"region_{region_code}.json")
+    if region_data and 'success' in region_data:
+        return region_data
+    
+    # Пробуем получить из основного файла
+    main_data = fetch_from_github_raw("cached_data.json")
+    if main_data and region_code in main_data:
+        if 'current' in main_data[region_code]:
+            region_data = main_data[region_code]['current']
+            region_data['success'] = True
+            return region_data
+    
+    # Если данные не найдены
     return {
         'success': False,
-        'error': 'Неверные учетные данные',
-        'error_code': 'INVALID_CREDENTIALS'
+        'error': f'Данные для региона {region_code} не найдены',
+        'region_code': region_code,
+        'timestamp': datetime.now().isoformat()
+    }
+
+def get_region_history(region_code):
+    """Получить историю региона из GitHub"""
+    region_code = region_code.upper()
+    
+    # Пробуем получить историю из отдельного файла
+    history_data = fetch_from_github_raw(f"history_{region_code}.json")
+    if history_data and 'history' in history_data:
+        return {
+            'success': True,
+            'region_code': region_code,
+            'history': history_data['history'],
+            'count': len(history_data['history']),
+            'timestamp': datetime.now().isoformat()
+        }
+    
+    # Пробуем получить из основного файла
+    main_data = fetch_from_github_raw("cached_data.json")
+    if main_data and region_code in main_data:
+        if 'history' in main_data[region_code]:
+            return {
+                'success': True,
+                'region_code': region_code,
+                'history': main_data[region_code]['history'],
+                'count': len(main_data[region_code]['history']),
+                'timestamp': datetime.now().isoformat()
+            }
+    
+    # Если история не найдена
+    return {
+        'success': False,
+        'error': f'История для региона {region_code} не найдена',
+        'region_code': region_code,
+        'timestamp': datetime.now().isoformat()
+    }
+
+def get_all_regions_summary():
+    """Получить сводку по всем регионам"""
+    # Пробуем получить основной файл
+    main_data = fetch_from_github_raw("cached_data.json")
+    
+    if main_data and '_meta' in main_data:
+        summary = {
+            'success': True,
+            'timestamp': datetime.now().isoformat(),
+            'total_regions': 0,
+            'regions': [],
+            'last_updated': main_data['_meta'].get('last_updated', 'unknown'),
+            'statistics': {}
+        }
+        
+        # Собираем данные по регионам
+        for region_code in Config.AVAILABLE_REGIONS:
+            if region_code in main_data:
+                region_info = main_data[region_code]
+                if 'current' in region_info:
+                    current = region_info['current']
+                    stats = current.get('stats', {})
+                    
+                    summary['regions'].append({
+                        'region_code': region_code,
+                        'region_name': current.get('region_name', region_code),
+                        'macroregion': current.get('macroregion', 'Неизвестно'),
+                        'total_bs': stats.get('total_bs', 0),
+                        'base_layer_percentage': stats.get('base_layer_percentage', 0),
+                        'power_problems': stats.get('power_problems', 0),
+                        'timestamp': current.get('timestamp', 'unknown')
+                    })
+        
+        summary['total_regions'] = len(summary['regions'])
+        
+        # Статистика
+        if summary['regions']:
+            summary['statistics'] = {
+                'total_basestations': sum(r['total_bs'] for r in summary['regions']),
+                'avg_availability': sum(r['base_layer_percentage'] for r in summary['regions']) / len(summary['regions']),
+                'total_power_problems': sum(r['power_problems'] for r in summary['regions']),
+                'regions_with_problems': len([r for r in summary['regions'] if r['power_problems'] > 0])
+            }
+        
+        return summary
+    
+    # Если основной файл не найден
+    return {
+        'success': False,
+        'error': 'Основной файл данных не найден',
+        'timestamp': datetime.now().isoformat()
     }
 
 # ================== API ENDPOINTS ==================
 
-@app.route('/api/auth/login', methods=['POST'])
-def auth_login():
-    """
-    🔐 Основная точка аутентификации
-    Подключается к вашему локальному LDAP серверу
-    """
-    start_time = datetime.now()
-    
-    try:
-        # Получаем данные
-        data = request.get_json()
-        if not data:
-            return jsonify({
-                'success': False,
-                'error': 'Требуется JSON тело запроса',
-                'error_code': 'NO_JSON_BODY'
-            }), 400
-        
-        username = data.get('username', '').strip()
-        password = data.get('password', '').strip()
-        
-        if not username or not password:
-            return jsonify({
-                'success': False,
-                'error': 'Требуется имя пользователя и пароль',
-                'error_code': 'MISSING_CREDENTIALS'
-            }), 400
-        
-        client_ip = request.remote_addr
-        logger.info(f"🔐 Запрос авторизации от {client_ip}, пользователь: {username}")
-        
-        # 🔧 ШАГ 1: Пробуем подключиться к LDAP серверу
-        if Config.LDAP_SERVER_URL:
-            logger.info(f"📡 Подключаюсь к LDAP: {Config.LDAP_SERVER_URL}")
-            
-            ldap_result = make_secure_request(
-                url=Config.LDAP_SERVER_URL,
-                method='POST',
-                data={'username': username, 'password': password}
-            )
-            
-            if ldap_result['success']:
-                # Успешная аутентификация через LDAP
-                result = ldap_result['data']
-                result.update({
-                    'api_server': 'dostupnost_api_render',
-                    'auth_flow': 'ldap_direct',
-                    'response_time_ms': int((datetime.now() - start_time).total_seconds() * 1000),
-                    'ldap_server_url': Config.LDAP_SERVER_URL,
-                    'client_ip': client_ip,
-                    'timestamp': datetime.now().isoformat()
-                })
-                
-                logger.info(f"✅ Успешная LDAP аутентификация: {username}")
-                return jsonify(result), 200
-            else:
-                # Ошибка подключения к LDAP
-                logger.warning(f"⚠️ Ошибка LDAP: {ldap_result.get('error')}")
-                
-                # 🔧 ШАГ 2: Пробуем фолбэк режим если включен
-                if Config.FALLBACK_MODE:
-                    logger.info("🔄 Пробую фолбэк режим...")
-                    fallback_result = check_fallback_credentials(username, password)
-                    
-                    if fallback_result['success']:
-                        fallback_result.update({
-                            'api_server': 'dostupnost_api_render',
-                            'auth_flow': 'fallback_mode',
-                            'warning': 'Используется фолбэк аутентификация. LDAP сервер недоступен.',
-                            'ldap_error': ldap_result.get('error'),
-                            'response_time_ms': int((datetime.now() - start_time).total_seconds() * 1000),
-                            'timestamp': datetime.now().isoformat()
-                        })
-                        
-                        logger.info(f"✅ Успешная фолбэк аутентификация: {username}")
-                        return jsonify(fallback_result), 200
-                
-                # Возвращаем ошибку LDAP
-                return jsonify({
-                    'success': False,
-                    'error': ldap_result.get('error', 'Ошибка авторизации'),
-                    'details': ldap_result.get('details', ''),
-                    'error_code': 'LDAP_CONNECTION_ERROR',
-                    'timestamp': datetime.now().isoformat(),
-                    'suggestions': [
-                        'Проверьте доступность LDAP сервера',
-                        'Убедитесь что порт 8443 открыт на роутере',
-                        'Проверьте правильность LDAP_SERVER_URL'
-                    ]
-                }), 503  # 503 Service Unavailable
-        else:
-            # LDAP_SERVER_URL не настроен
-            logger.error("❌ LDAP_SERVER_URL не настроен в Render.com")
-            
-            # 🔧 ШАГ 3: Только фолбэк режим
-            if Config.FALLBACK_MODE:
-                fallback_result = check_fallback_credentials(username, password)
-                
-                if fallback_result['success']:
-                    fallback_result.update({
-                        'api_server': 'dostupnost_api_render',
-                        'auth_flow': 'fallback_only',
-                        'warning': 'LDAP сервер не настроен. Используется только фолбэк режим.',
-                        'response_time_ms': int((datetime.now() - start_time).total_seconds() * 1000),
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    
-                    logger.info(f"✅ Фолбэк аутентификация (без LDAP): {username}")
-                    return jsonify(fallback_result), 200
-            
-            return jsonify({
-                'success': False,
-                'error': 'Сервер авторизации не настроен',
-                'error_code': 'LDAP_NOT_CONFIGURED',
-                'instructions': 'Настройте переменную LDAP_SERVER_URL в Render.com Dashboard',
-                'example': 'LDAP_SERVER_URL = https://ваш_внешний_ip:8443/api/ldap/auth',
-                'timestamp': datetime.now().isoformat()
-            }), 503
-            
-    except Exception as e:
-        logger.error(f"💥 Критическая ошибка в auth_login: {e}")
-        return jsonify({
-            'success': False,
-            'error': 'Внутренняя ошибка сервера',
-            'error_code': 'SERVER_ERROR',
-            'timestamp': datetime.now().isoformat()
-        }), 500
-
 @app.route('/api/region/<region_code>', methods=['GET'])
-def get_region_data(region_code):
+def region_data_endpoint(region_code):
     """
     🗺️ Получение данных региона
-    Подключается к локальному Data API если настроено
     """
-    try:
-        region_code = region_code.upper()
-        logger.info(f"🗺️ Запрос региона: {region_code}")
-        
-        # 🔧 Пробуем локальный Data API
-        if Config.DATA_API_URL:
-            data_url = f"{Config.DATA_API_URL}/api/region/{region_code}"
-            result = make_secure_request(data_url, method='GET')
-            
-            if result['success']:
-                data = result['data']
-                data.update({
-                    'source': 'external_data_api',
-                    'api_timestamp': datetime.now().isoformat(),
-                    'data_server': Config.DATA_API_URL
-                })
-                logger.info(f"✅ Данные получены из Data API")
-                return jsonify(data)
-        
-        # 📌 Фолбэк данные
-        if region_code in Config.FALLBACK_REGIONS:
-            data = Config.FALLBACK_REGIONS[region_code].copy()
-            data.update({
-                'success': True,
-                'region_code': region_code,
-                'is_fallback': True,
-                'source': 'fallback_data',
-                'api_timestamp': datetime.now().isoformat(),
-                'warning': 'Используются тестовые данные' if not Config.DATA_API_URL else 'Data API недоступен'
-            })
-            logger.info(f"📋 Используются фолбэк данные для {region_code}")
-            return jsonify(data)
-        
-        # ❌ Регион не найден
+    logger.info(f"🗺️ Запрос данных региона: {region_code}")
+    
+    region_code = region_code.upper()
+    if region_code not in Config.AVAILABLE_REGIONS:
         return jsonify({
             'success': False,
             'error': f'Регион {region_code} не найден',
-            'available_regions': list(Config.FALLBACK_REGIONS.keys()),
+            'available_regions': Config.AVAILABLE_REGIONS,
             'timestamp': datetime.now().isoformat()
         }), 404
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка получения региона {region_code}: {e}")
+    
+    region_data = get_region_data(region_code)
+    return jsonify(region_data)
+
+@app.route('/api/region/<region_code>/history', methods=['GET'])
+def region_history_endpoint(region_code):
+    """
+    📊 Получение истории региона
+    """
+    logger.info(f"📊 Запрос истории региона: {region_code}")
+    
+    region_code = region_code.upper()
+    if region_code not in Config.AVAILABLE_REGIONS:
         return jsonify({
             'success': False,
-            'error': 'Ошибка получения данных',
-            'region_code': region_code,
+            'error': f'Регион {region_code} не найден',
+            'available_regions': Config.AVAILABLE_REGIONS,
             'timestamp': datetime.now().isoformat()
-        }), 500
+        }), 404
+    
+    history_data = get_region_history(region_code)
+    
+    # Ограничиваем количество записей, если нужно
+    limit = request.args.get('limit')
+    if limit and limit.isdigit():
+        limit = int(limit)
+        if history_data.get('success') and 'history' in history_data:
+            history_data['history'] = history_data['history'][:limit]
+            history_data['count'] = len(history_data['history'])
+    
+    return jsonify(history_data)
 
-@app.route('/api/test/ldap', methods=['GET'])
-def test_ldap_connection():
+@app.route('/api/regions/summary', methods=['GET'])
+def regions_summary_endpoint():
     """
-    🧪 Тестирование подключения к LDAP серверу
+    📈 Сводка по всем регионам
     """
+    logger.info("📈 Запрос сводки по всем регионам")
+    summary = get_all_regions_summary()
+    return jsonify(summary)
+
+@app.route('/api/regions/list', methods=['GET'])
+def regions_list_endpoint():
+    """
+    📋 Список всех доступных регионов
+    """
+    logger.info("📋 Запрос списка регионов")
+    
+    # Пробуем получить актуальные данные из GitHub
+    main_data = fetch_from_github_raw("cached_data.json")
+    
+    if main_data and '_meta' in main_data:
+        regions_list = []
+        for region_code in Config.AVAILABLE_REGIONS:
+            if region_code in main_data:
+                region_info = main_data[region_code]
+                if 'current' in region_info:
+                    current = region_info['current']
+                    regions_list.append({
+                        'code': region_code,
+                        'name': current.get('region_name', region_code),
+                        'macroregion': current.get('macroregion', 'Неизвестно'),
+                        'has_data': True,
+                        'last_updated': current.get('timestamp', 'unknown')
+                    })
+                else:
+                    regions_list.append({
+                        'code': region_code,
+                        'name': region_code,
+                        'macroregion': 'Неизвестно',
+                        'has_data': False,
+                        'last_updated': 'unknown'
+                    })
+            else:
+                regions_list.append({
+                    'code': region_code,
+                    'name': region_code,
+                    'macroregion': 'Неизвестно',
+                    'has_data': False,
+                    'last_updated': 'unknown'
+                })
+        
+        return jsonify({
+            'success': True,
+            'count': len(regions_list),
+            'regions': regions_list,
+            'total_available': len(Config.AVAILABLE_REGIONS),
+            'last_updated': main_data['_meta'].get('last_updated', 'unknown'),
+            'timestamp': datetime.now().isoformat()
+        })
+    
+    # Если не удалось получить данные из GitHub
+    return jsonify({
+        'success': True,
+        'count': len(Config.AVAILABLE_REGIONS),
+        'regions': [{
+            'code': code,
+            'name': code,
+            'macroregion': 'Неизвестно',
+            'has_data': False
+        } for code in Config.AVAILABLE_REGIONS],
+        'total_available': len(Config.AVAILABLE_REGIONS),
+        'warning': 'Не удалось получить актуальные данные, показан список регионов по умолчанию',
+        'timestamp': datetime.now().isoformat()
+    })
+
+@app.route('/api/test/github', methods=['GET'])
+def test_github_endpoint():
+    """
+    🧪 Тестирование подключения к GitHub
+    """
+    logger.info("🧪 Тест подключения к GitHub")
+    
     test_results = {
-        'test': 'ldap_connection_test',
+        'test': 'github_connection_test',
         'timestamp': datetime.now().isoformat(),
         'config': {
-            'ldap_server_url': Config.LDAP_SERVER_URL,
-            'request_timeout': Config.REQUEST_TIMEOUT,
-            'verify_ssl': Config.VERIFY_SSL,
-            'fallback_mode': Config.FALLBACK_MODE
+            'github_repo': Config.GITHUB_REPO,
+            'github_branch': Config.GITHUB_BRANCH,
+            'github_token_set': bool(Config.GITHUB_TOKEN),
+            'use_github_api': Config.USE_GITHUB_API,
+            'cache_timeout': Config.CACHE_TIMEOUT
         },
         'tests': {}
     }
     
     # Тест 1: Проверка конфигурации
     test_results['tests']['config_check'] = {
-        'passed': bool(Config.LDAP_SERVER_URL),
-        'message': 'LDAP_SERVER_URL настроен' if Config.LDAP_SERVER_URL else 'LDAP_SERVER_URL не настроен',
-        'url': Config.LDAP_SERVER_URL or 'не указан'
+        'passed': bool(Config.GITHUB_REPO),
+        'message': 'GitHub репозиторий настроен' if Config.GITHUB_REPO else 'GitHub репозиторий не настроен',
+        'repo': Config.GITHUB_REPO,
+        'branch': Config.GITHUB_BRANCH
     }
     
-    # Тест 2: Пинг LDAP сервера (если настроен)
-    if Config.LDAP_SERVER_URL:
-        try:
-            # Пробуем получить health status от LDAP сервера
-            health_url = Config.LDAP_SERVER_URL.replace('/api/ldap/auth', '/api/ldap/health')
-            
-            result = make_secure_request(health_url, method='GET')
-            
-            test_results['tests']['ldap_health'] = {
-                'passed': result['success'],
-                'message': result.get('error', 'Успешно') if not result['success'] else 'LDAP сервер доступен',
-                'response_time': result.get('response_time'),
-                'status_code': result.get('status_code')
-            }
-        except Exception as e:
-            test_results['tests']['ldap_health'] = {
-                'passed': False,
-                'message': f'Ошибка теста: {str(e)}'
-            }
-    
-    # Тест 3: Тестовая аутентификация
-    test_results['tests']['test_auth'] = {
-        'available': True,
-        'test_users': list(Config.FALLBACK_USERS.keys()) if Config.FALLBACK_MODE else [],
-        'message': 'Фолбэк режим включен' if Config.FALLBACK_MODE else 'Только LDAP'
+    # Тест 2: Проверка основного файла
+    main_data = fetch_from_github_raw("cached_data.json")
+    test_results['tests']['main_file'] = {
+        'passed': main_data is not None,
+        'message': 'Основной файл данных найден' if main_data else 'Основной файл данных не найден',
+        'file': 'cached_data.json'
     }
+    
+    # Тест 3: Проверка файла региона (пример BRT)
+    region_data = fetch_from_github_raw("region_BRT.json")
+    test_results['tests']['region_file'] = {
+        'passed': region_data is not None,
+        'message': 'Файл региона BRT найден' if region_data else 'Файл региона BRT не найден',
+        'file': 'region_BRT.json'
+    }
+    
+    # Тест 4: Количество доступных регионов
+    if main_data:
+        regions_in_data = [k for k in main_data.keys() if k != '_meta']
+        test_results['tests']['regions_count'] = {
+            'passed': len(regions_in_data) > 0,
+            'message': f'Найдено {len(regions_in_data)} регионов в данных',
+            'count': len(regions_in_data),
+            'regions': regions_in_data[:10]  # Показываем первые 10
+        }
     
     # Общая оценка
     passed_tests = [t for t in test_results['tests'].values() if t.get('passed', False)]
     if len(passed_tests) == len(test_results['tests']):
         test_results['overall'] = 'PASSED'
-    elif len(passed_tests) > 0:
+    elif len(passed_tests) >= 2:
         test_results['overall'] = 'PARTIAL'
     else:
         test_results['overall'] = 'FAILED'
     
     return jsonify(test_results)
 
-@app.route('/api/test', methods=['GET'])
-def test_api():
-    """🧪 Полный тест API сервера"""
+@app.route('/api/cache/clear', methods=['POST'])
+def clear_cache_endpoint():
+    """
+    🗑️ Очистка кеша (только для администраторов)
+    """
+    # Простая проверка для безопасности
+    auth_token = request.headers.get('X-Admin-Token')
+    if not auth_token or auth_token != os.environ.get('ADMIN_TOKEN', ''):
+        return jsonify({
+            'success': False,
+            'error': 'Доступ запрещен',
+            'timestamp': datetime.now().isoformat()
+        }), 403
+    
+    DataCache.clear()
+    logger.info("🗑️ Кеш очищен")
+    
     return jsonify({
-        'service': 'dostupnost_api',
-        'status': 'running',
-        'timestamp': datetime.now().isoformat(),
-        'version': '2.0.0',
-        'config_summary': {
-            'ldap_configured': bool(Config.LDAP_SERVER_URL),
-            'data_api_configured': bool(Config.DATA_API_URL),
-            'fallback_mode': Config.FALLBACK_MODE,
-            'request_timeout': Config.REQUEST_TIMEOUT
-        },
-        'endpoints': [
-            {'method': 'POST', 'path': '/api/auth/login', 'desc': 'Аутентификация'},
-            {'method': 'GET', 'path': '/api/region/{code}', 'desc': 'Данные региона'},
-            {'method': 'GET', 'path': '/api/test/ldap', 'desc': 'Тест LDAP'},
-            {'method': 'GET', 'path': '/api/test', 'desc': 'Тест API'},
-            {'method': 'GET', 'path': '/api/health', 'desc': 'Здоровье'}
-        ],
-        'available_regions': list(Config.FALLBACK_REGIONS.keys()),
-        'instructions': {
-            'setup_ldap': 'Настройте LDAP_SERVER_URL = https://ваш_ip:8443/api/ldap/auth',
-            'test_auth': 'Используйте test@t2.ru / Test123! для теста'
-        }
+        'success': True,
+        'message': 'Кеш успешно очищен',
+        'timestamp': datetime.now().isoformat()
     })
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """Проверка здоровья API"""
+    """
+    🩺 Проверка здоровья API
+    """
+    # Проверяем подключение к GitHub
+    main_data = fetch_from_github_raw("cached_data.json")
+    
     return jsonify({
         'status': 'healthy',
-        'service': 'dostupnost_api',
-        'environment': 'production',
+        'service': 'region_data_api',
         'timestamp': datetime.now().isoformat(),
-        'checks': {
-            'api_server': 'running',
-            'ldap_configured': bool(Config.LDAP_SERVER_URL),
-            'fallback_available': Config.FALLBACK_MODE
-        }
+        'github_connection': 'ok' if main_data else 'unavailable',
+        'cache_size': len(DataCache._cache),
+        'uptime': get_uptime(),
+        'endpoints': [
+            '/api/region/{code}',
+            '/api/region/{code}/history',
+            '/api/regions/summary',
+            '/api/regions/list',
+            '/api/test/github',
+            '/api/health'
+        ]
     })
 
 @app.route('/')
 def home():
-    """Домашняя страница"""
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>🌐 Dostupnost API</title>
-        <meta charset="utf-8">
-        <style>
-            body {{ font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }}
-            .card {{ background: #f5f5f5; padding: 20px; margin: 20px 0; border-radius: 8px; }}
-            .success {{ color: #4CAF50; font-weight: bold; }}
-            .warning {{ color: #FF9800; font-weight: bold; }}
-            .error {{ color: #f44336; font-weight: bold; }}
-            code {{ background: #eee; padding: 2px 6px; border-radius: 3px; }}
-            pre {{ background: #f8f8f8; padding: 10px; border-radius: 5px; overflow-x: auto; }}
-        </style>
-    </head>
-    <body>
-        <h1>🌐 Dostupnost API Server</h1>
-        <p>API сервер для Android приложения мониторинга доступности</p>
-        
-        <div class="card">
-            <h2>⚙️ Конфигурация</h2>
-            <p>LDAP сервер: <span class="{'success' if Config.LDAP_SERVER_URL else 'error'}">
-                {Config.LDAP_SERVER_URL or '❌ НЕ НАСТРОЕН'}
-            </span></p>
-            <p>Data API: <span class="{'success' if Config.DATA_API_URL else 'warning'}">
-                {Config.DATA_API_URL or '⚠️ ОПЦИОНАЛЬНО'}
-            </span></p>
-            <p>Фолбэк режим: <span class="{'success' if Config.FALLBACK_MODE else 'warning'}">
-                {'✅ ВКЛЮЧЕН' if Config.FALLBACK_MODE else '⚠️ ВЫКЛЮЧЕН'}
-            </span></p>
-        </div>
-        
-        <div class="card">
-            <h2>🔗 Основные Endpoints</h2>
-            <ul>
-                <li><code>POST /api/auth/login</code> - Аутентификация через LDAP</li>
-                <li><code>GET /api/region/{code}</code> - Данные региона (BRT, OMS, TEST)</li>
-                <li><code>GET /api/test/ldap</code> - Тест подключения к LDAP</li>
-                <li><code>GET /api/test</code> - Полный тест системы</li>
-                <li><code>GET /api/health</code> - Проверка здоровья</li>
-            </ul>
-        </div>
-        
-        <div class="card">
-            <h2>🔧 Настройка LDAP сервера</h2>
-            <p>1. Убедитесь что LDAP сервер запущен на вашем компьютере</p>
-            <p>2. Откройте порт 8443 на роутере:</p>
-            <pre>Внешний порт: 8443 → Внутренний IP: [ваш IP]:8443</pre>
-            <p>3. Узнайте ваш внешний IP:</p>
-            <pre>curl ifconfig.me</pre>
-            <p>4. В Render.com Dashboard добавьте переменную:</p>
-            <pre>LDAP_SERVER_URL = https://[ВАШ_ВНЕШНИЙ_IP]:8443/api/ldap/auth</pre>
-        </div>
-        
-        <div class="card">
-            <h2>🧪 Тестирование</h2>
-            <p><a href="/api/test">Полный тест системы</a></p>
-            <p><a href="/api/test/ldap">Тест LDAP подключения</a></p>
-            <p><a href="/api/health">Проверка здоровья</a></p>
-        </div>
-        
-        <div class="card">
-            <h2>📱 Тестовые пользователи (фолбэк)</h2>
-            <ul>
-                <li><code>admin</code> / <code>admin123</code></li>
-                <li><code>test@t2.ru</code> / <code>Test123!</code></li>
-                <li><code>danil.vasilchenko@t2.ru</code> / <code>Daniil2024!</code></li>
-            </ul>
-        </div>
-    </body>
-    </html>
     """
+    🏠 Домашняя страница
+    """
+    main_data = fetch_from_github_raw("cached_data.json")
+    
+   
+# ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
+
+# Глобальная переменная для времени запуска
+_start_time = datetime.now()
+
+def get_uptime():
+    """Получить время работы сервера"""
+    delta = datetime.now() - _start_time
+    hours, remainder = divmod(delta.total_seconds(), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{int(hours)}ч {int(minutes)}м {int(seconds)}с"
 
 # ================== ЗАПУСК СЕРВЕРА ==================
 
@@ -560,41 +552,33 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     
     print("=" * 70)
-    print("🌐 DOSTUPNOST API СЕРВЕР НА RENDER.COM")
-    print("Подключение к локальному LDAP серверу")
+    print("🌐 REGION DATA API СЕРВЕР НА RENDER.COM")
+    print("Данные берутся из GitHub репозитория")
     print("=" * 70)
     
     print(f"\n⚙️  ТЕКУЩАЯ КОНФИГУРАЦИЯ:")
-    print(f"   • LDAP сервер:    {Config.LDAP_SERVER_URL or '❌ НЕ НАСТРОЕН'}")
-    print(f"   • Data API:       {Config.DATA_API_URL or '⚠️  ОПЦИОНАЛЬНО'}")
-    print(f"   • Таймаут:        {Config.REQUEST_TIMEOUT} секунд")
-    print(f"   • Фолбэк режим:   {'✅ ВКЛЮЧЕН' if Config.FALLBACK_MODE else '⚠️ ВЫКЛЮЧЕН'}")
-    print(f"   • Проверка SSL:   {'✅ ВКЛЮЧЕНА' if Config.VERIFY_SSL else '⚠️ ОТКЛЮЧЕНА (самоподписанные)'}")
+    print(f"   • GitHub репозиторий: {Config.GITHUB_REPO}")
+    print(f"   • Ветка:              {Config.GITHUB_BRANCH}")
+    print(f"   • GitHub токен:       {'✅ Установлен' if Config.GITHUB_TOKEN else '⚠️ Не установлен'}")
+    print(f"   • Таймаут запросов:   {Config.REQUEST_TIMEOUT} секунд")
+    print(f"   • Кеширование:        {Config.CACHE_TIMEOUT} секунд")
+    print(f"   • Регионов доступно:  {len(Config.AVAILABLE_REGIONS)}")
     
     print(f"\n📋 ДОСТУПНЫЕ ENDPOINTS:")
-    print(f"   • POST /api/auth/login    - Аутентификация")
-    print(f"   • GET  /api/region/BRT    - Данные Бурятии")
-    print(f"   • GET  /api/test/ldap     - Тест LDAP")
-    print(f"   • GET  /api/test          - Тест системы")
-    print(f"   • GET  /api/health        - Проверка здоровья")
-    
-    print(f"\n🔧 ИНСТРУКЦИЯ ДЛЯ НАСТРОЙКИ:")
-    print(f"   1. Запустите LDAP сервер на вашем компьютере")
-    print(f"   2. Откройте порт 8443 на роутере:")
-    print(f"      Внешний порт 8443 → Внутренний IP:8443")
-    print(f"   3. Узнайте ваш внешний IP:")
-    print(f"      На компьютере выполните: curl ifconfig.me")
-    print(f"   4. В Render.com Dashboard добавьте:")
-    print(f"      LDAP_SERVER_URL = https://[ВАШ_IP]:8443/api/ldap/auth")
+    print(f"   • GET /api/region/{{code}}          - Данные региона")
+    print(f"   • GET /api/region/{{code}}/history  - История региона")
+    print(f"   • GET /api/regions/summary         - Сводка по всем регионам")
+    print(f"   • GET /api/regions/list            - Список регионов")
+    print(f"   • GET /api/test/github             - Тест GitHub")
+    print(f"   • GET /api/health                  - Проверка здоровья")
     
     print(f"\n📱 ДЛЯ ANDROID ПРИЛОЖЕНИЯ:")
-    print(f"   В файле ApiClient.kt укажите:")
-    print(f'   private const val BASE_URL = "https://ваш-сервис.onrender.com/"')
+    print(f"   Базовый URL: https://ваш-сервис.onrender.com/")
     
-    print(f"\n⚠️  ВАЖНЫЕ ЗАМЕЧАНИЯ:")
-    print(f"   • LDAP сервер использует самоподписанный SSL сертификат")
-    print(f"   • Для запросов установлен verify=False")
-    print(f"   • При недоступности LDAP работает фолбэк режим")
+    print(f"\n⚠️  ВАЖНО:")
+    print(f"   • Данные обновляются на GitHub каждые 10 минут")
+    print(f"   • API кеширует данные на {Config.CACHE_TIMEOUT} секунд")
+    print(f"   • Для увеличения лимита запросов установите GITHUB_TOKEN")
     print("=" * 70)
     
     print(f"\n🚀 Запуск API сервера на порту {port}...")
