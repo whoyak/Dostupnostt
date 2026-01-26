@@ -1,17 +1,17 @@
 """
-🌐 API СЕРВЕР ДЛЯ ANDROID ПРИЛОЖЕНИЯ С HTTPS
-Запускается на Render.com, связывается с локальными HTTPS серверами
+🌐 API СЕРВЕР ДЛЯ ANDROID ПРИЛОЖЕНИЯ
+Запускается на Render.com, подключается к локальному LDAP серверу в сети t2
 """
 
 import os
 import requests
-from datetime import datetime
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-import json
 import logging
+import json
+from datetime import datetime
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from functools import wraps
 import urllib3
-from typing import Dict, Optional
 
 # Отключаем предупреждения о самоподписанных сертификатах
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -25,131 +25,180 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # ================== КОНФИГУРАЦИЯ ==================
 
 class Config:
-    """Конфигурация API сервера"""
+    """Конфигурация из переменных окружения Render.com"""
     
-    # ⚠️ ЭТИ ПЕРЕМЕННЫЕ НАСТРАИВАЮТСЯ В RENDER.COM DASHBOARD!
-    # Settings → Environment → Add Environment Variable
-    
-    # URL твоего локального LDAP сервера (HTTPS!)
+    # 🔐 URL вашего локального LDAP сервера (самое важное!)
     LDAP_SERVER_URL = os.environ.get('LDAP_SERVER_URL', '')
-    # Пример: https://95.165.123.456:8443
+    # Формат: https://ВАШ_ВНЕШНИЙ_IP:8443/api/ldap/auth
+    # Пример: https://95.165.123.456:8443/api/ldap/auth
     
-    # URL твоего локального Data API (HTTPS!)
+    # 📊 Данные регионов (опционально)
     DATA_API_URL = os.environ.get('DATA_API_URL', '')
-    # Пример: https://95.165.123.456:8444
     
-    # Настройки запросов
-    REQUEST_TIMEOUT = 10  # секунд
-    VERIFY_SSL = False    # Не проверять SSL для самоподписанных сертификатов
+    # ⚙️ Настройки запросов
+    REQUEST_TIMEOUT = int(os.environ.get('REQUEST_TIMEOUT', 15))  # Увеличил таймаут
+    VERIFY_SSL = os.environ.get('VERIFY_SSL', 'false').lower() == 'true'
     
-    # Фолбэк данные
-    FALLBACK_DATA = {
+    # 🔧 Фолбэк режим (если LDAP недоступен)
+    FALLBACK_MODE = os.environ.get('FALLBACK_MODE', 'true').lower() == 'true'
+    
+    # 📝 Тестовые пользователи для фолбэка
+    FALLBACK_USERS = {
+        'admin': 'admin123',
+        'test@t2.ru': 'Test123!',
+        'danil.vasilchenko@t2.ru': 'Daniil2024!',
+        'user@t2.ru': 'User123!'
+    }
+    
+    # 📍 Фолбэк данные регионов
+    FALLBACK_REGIONS = {
         'BRT': {
-            'region_name': 'Бурятия (фолбэк данные)',
-            'base_layer': '📡 Данные временно недоступны\n\nСервер данных обновляется...',
-            'non_priority': '📶 Технологии: обновление данных...',
+            'region_name': 'Бурятия',
+            'base_layer': '📡 Основной слой: 142 БС\n✅ Работают: 139\n⚠️ Проблемы: 3',
+            'non_priority': '📶 Технологии: 4G-92%, 3G-8%',
             'stats': {
                 'total_bs': 150,
                 'base_layer_count': 142,
                 'power_problems': 3,
                 'non_priority_percentage': 5
             }
+        },
+        'OMS': {
+            'region_name': 'Омская область',
+            'base_layer': '📡 Основной слой: 215 БС\n✅ Работают: 210\n⚠️ Проблемы: 5',
+            'non_priority': '📶 Технологии: 4G-95%, 3G-5%',
+            'stats': {
+                'total_bs': 230,
+                'base_layer_count': 215,
+                'power_problems': 5,
+                'non_priority_percentage': 2
+            }
+        },
+        'TEST': {
+            'region_name': 'Тестовый регион',
+            'base_layer': '📡 Тестовые данные\n✅ Все работает\n⚠️ Нет проблем',
+            'non_priority': '📶 Технологии: 4G-100%',
+            'stats': {
+                'total_bs': 100,
+                'base_layer_count': 100,
+                'power_problems': 0,
+                'non_priority_percentage': 0
+            }
         }
     }
 
 # ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
 
-def make_secure_request(url: str, method: str = 'GET', data: dict = None) -> dict:
+def make_secure_request(url, method='GET', data=None, headers=None):
     """
-    Безопасный HTTP запрос с поддержкой HTTPS и самоподписанных сертификатов
+    Безопасный HTTP запрос с поддержкой самоподписанных сертификатов
     """
     try:
-        logger.info(f"📡 Запрос {method} к: {url}")
+        logger.info(f"📡 {method} запрос к: {url}")
         
-        # Настраиваем параметры запроса
         request_kwargs = {
             'timeout': Config.REQUEST_TIMEOUT,
-            'verify': Config.VERIFY_SSL,  # Важно: не проверяем SSL для самоподписанных
-            'headers': {'Content-Type': 'application/json'}
+            'verify': Config.VERIFY_SSL,  # Важно: False для самоподписанных
+            'headers': headers or {'Content-Type': 'application/json'}
         }
         
-        # Добавляем данные для POST запроса
         if method.upper() == 'POST' and data:
             request_kwargs['json'] = data
         
-        # Выполняем запрос
+        start_time = datetime.now()
+        
         if method.upper() == 'POST':
             response = requests.post(url, **request_kwargs)
-        else:
+        elif method.upper() == 'GET':
             response = requests.get(url, **request_kwargs)
+        else:
+            return {'success': False, 'error': f'Неподдерживаемый метод: {method}'}
         
-        logger.info(f"📨 Ответ {response.status_code} от {url}")
+        response_time = (datetime.now() - start_time).total_seconds()
+        logger.info(f"📨 Ответ {response.status_code} за {response_time:.2f}с")
         
         if response.status_code == 200:
             return {
                 'success': True,
                 'data': response.json(),
                 'status_code': response.status_code,
-                'response_time': response.elapsed.total_seconds()
+                'response_time': response_time
             }
         else:
-            error_text = response.text[:200] if response.text else 'No response body'
             return {
                 'success': False,
                 'error': f'HTTP {response.status_code}',
                 'status_code': response.status_code,
-                'details': error_text,
-                'url': url
+                'response_text': response.text[:200]
             }
             
     except requests.exceptions.SSLError as e:
-        logger.error(f"🔒 Ошибка SSL при подключении к {url}: {e}")
+        logger.error(f"🔒 Ошибка SSL: {e}")
         return {
             'success': False,
-            'error': 'SSL ошибка',
-            'details': 'Сертификат не доверен. Для самоподписанных сертификатов нужна настройка verify=False',
-            'url': url
+            'error': 'Ошибка SSL сертификата',
+            'details': 'Используйте самоподписанный сертификат или настройте verify=False'
         }
     except requests.exceptions.Timeout:
-        logger.error(f"⏰ Таймаут при запросе к {url}")
+        logger.error(f"⏰ Таймаут {Config.REQUEST_TIMEOUT}с")
         return {
             'success': False,
-            'error': 'Таймаут подключения',
-            'details': f'Сервер {url} не ответил за {Config.REQUEST_TIMEOUT} секунд'
+            'error': f'Таймаут подключения ({Config.REQUEST_TIMEOUT}с)',
+            'details': 'LDAP сервер не ответил. Проверьте доступность и порты.'
         }
-    except requests.exceptions.ConnectionError:
-        logger.error(f"🔌 Ошибка подключения к {url}")
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"🔌 Ошибка подключения: {e}")
         return {
             'success': False,
             'error': 'Ошибка подключения',
-            'details': f'Не удалось подключиться к {url}. Проверьте доступность сервера и порты.'
+            'details': f'Не удалось подключиться к серверу. Проверьте URL и доступность.'
         }
     except Exception as e:
-        logger.error(f"❌ Ошибка при запросе к {url}: {e}")
+        logger.error(f"❌ Ошибка запроса: {e}")
         return {
             'success': False,
-            'error': 'Внутренняя ошибка',
+            'error': 'Внутренняя ошибка запроса',
             'details': str(e)[:100]
         }
+
+def check_fallback_credentials(username, password):
+    """Проверка учетных данных в фолбэк режиме"""
+    if username in Config.FALLBACK_USERS:
+        if Config.FALLBACK_USERS[username] == password:
+            return {
+                'success': True,
+                'username': username,
+                'display_name': username.split('@')[0] if '@' in username else username,
+                'email': username if '@' in username else f'{username}@t2.ru',
+                'department': 'Технический отдел',
+                'title': 'Пользователь системы',
+                'auth_source': 'fallback_mode'
+            }
+    
+    return {
+        'success': False,
+        'error': 'Неверные учетные данные',
+        'error_code': 'INVALID_CREDENTIALS'
+    }
 
 # ================== API ENDPOINTS ==================
 
 @app.route('/api/auth/login', methods=['POST'])
 def auth_login():
     """
-    🔐 Аутентификация пользователя
-    Работает через локальный HTTPS LDAP сервер
+    🔐 Основная точка аутентификации
+    Подключается к вашему локальному LDAP серверу
     """
     start_time = datetime.now()
     
     try:
-        # Получаем данные от клиента
-        data = request.json
+        # Получаем данные
+        data = request.get_json()
         if not data:
             return jsonify({
                 'success': False,
@@ -167,224 +216,251 @@ def auth_login():
                 'error_code': 'MISSING_CREDENTIALS'
             }), 400
         
-        logger.info(f"🔐 Запрос авторизации для пользователя: {username}")
+        client_ip = request.remote_addr
+        logger.info(f"🔐 Запрос авторизации от {client_ip}, пользователь: {username}")
         
-        # Проверяем настройки LDAP сервера
-        if not Config.LDAP_SERVER_URL:
+        # 🔧 ШАГ 1: Пробуем подключиться к LDAP серверу
+        if Config.LDAP_SERVER_URL:
+            logger.info(f"📡 Подключаюсь к LDAP: {Config.LDAP_SERVER_URL}")
+            
+            ldap_result = make_secure_request(
+                url=Config.LDAP_SERVER_URL,
+                method='POST',
+                data={'username': username, 'password': password}
+            )
+            
+            if ldap_result['success']:
+                # Успешная аутентификация через LDAP
+                result = ldap_result['data']
+                result.update({
+                    'api_server': 'dostupnost_api_render',
+                    'auth_flow': 'ldap_direct',
+                    'response_time_ms': int((datetime.now() - start_time).total_seconds() * 1000),
+                    'ldap_server_url': Config.LDAP_SERVER_URL,
+                    'client_ip': client_ip,
+                    'timestamp': datetime.now().isoformat()
+                })
+                
+                logger.info(f"✅ Успешная LDAP аутентификация: {username}")
+                return jsonify(result), 200
+            else:
+                # Ошибка подключения к LDAP
+                logger.warning(f"⚠️ Ошибка LDAP: {ldap_result.get('error')}")
+                
+                # 🔧 ШАГ 2: Пробуем фолбэк режим если включен
+                if Config.FALLBACK_MODE:
+                    logger.info("🔄 Пробую фолбэк режим...")
+                    fallback_result = check_fallback_credentials(username, password)
+                    
+                    if fallback_result['success']:
+                        fallback_result.update({
+                            'api_server': 'dostupnost_api_render',
+                            'auth_flow': 'fallback_mode',
+                            'warning': 'Используется фолбэк аутентификация. LDAP сервер недоступен.',
+                            'ldap_error': ldap_result.get('error'),
+                            'response_time_ms': int((datetime.now() - start_time).total_seconds() * 1000),
+                            'timestamp': datetime.now().isoformat()
+                        })
+                        
+                        logger.info(f"✅ Успешная фолбэк аутентификация: {username}")
+                        return jsonify(fallback_result), 200
+                
+                # Возвращаем ошибку LDAP
+                return jsonify({
+                    'success': False,
+                    'error': ldap_result.get('error', 'Ошибка авторизации'),
+                    'details': ldap_result.get('details', ''),
+                    'error_code': 'LDAP_CONNECTION_ERROR',
+                    'timestamp': datetime.now().isoformat(),
+                    'suggestions': [
+                        'Проверьте доступность LDAP сервера',
+                        'Убедитесь что порт 8443 открыт на роутере',
+                        'Проверьте правильность LDAP_SERVER_URL'
+                    ]
+                }), 503  # 503 Service Unavailable
+        else:
+            # LDAP_SERVER_URL не настроен
             logger.error("❌ LDAP_SERVER_URL не настроен в Render.com")
+            
+            # 🔧 ШАГ 3: Только фолбэк режим
+            if Config.FALLBACK_MODE:
+                fallback_result = check_fallback_credentials(username, password)
+                
+                if fallback_result['success']:
+                    fallback_result.update({
+                        'api_server': 'dostupnost_api_render',
+                        'auth_flow': 'fallback_only',
+                        'warning': 'LDAP сервер не настроен. Используется только фолбэк режим.',
+                        'response_time_ms': int((datetime.now() - start_time).total_seconds() * 1000),
+                        'timestamp': datetime.now().isoformat()
+                    })
+                    
+                    logger.info(f"✅ Фолбэк аутентификация (без LDAP): {username}")
+                    return jsonify(fallback_result), 200
+            
             return jsonify({
                 'success': False,
                 'error': 'Сервер авторизации не настроен',
+                'error_code': 'LDAP_NOT_CONFIGURED',
                 'instructions': 'Настройте переменную LDAP_SERVER_URL в Render.com Dashboard',
-                'example': 'LDAP_SERVER_URL = https://ваш_ip:8443'
+                'example': 'LDAP_SERVER_URL = https://ваш_внешний_ip:8443/api/ldap/auth',
+                'timestamp': datetime.now().isoformat()
             }), 503
-        
-        # 📌 ФОЛБЭК: Тестовый пользователь (если LDAP не настроен или для теста)
-        if username == 'admin' and password == 'admin':
-            logger.info("👨‍💻 Используется тестовая учетка admin")
-            return jsonify({
-                'success': True,
-                'username': 'admin',
-                'display_name': 'Администратор (тест)',
-                'auth_source': 'test',
-                'timestamp': datetime.now().isoformat(),
-                'warning': 'Используется тестовая авторизация',
-                'ldap_server': Config.LDAP_SERVER_URL
-            }), 200
-        
-        # Отправляем запрос на локальный LDAP сервер
-        ldap_url = f"{Config.LDAP_SERVER_URL}/api/ldap/auth"
-        logger.info(f"📡 Перенаправляю запрос на LDAP: {ldap_url}")
-        
-        ldap_result = make_secure_request(
-            url=ldap_url,
-            method='POST',
-            data={'username': username, 'password': password}
-        )
-        
-        # Обрабатываем результат
-        if ldap_result['success']:
-            result = ldap_result['data']
-            result.update({
-                'api_timestamp': datetime.now().isoformat(),
-                'response_time_ms': int((datetime.now() - start_time).total_seconds() * 1000),
-                'auth_flow': 'ldap_https_remote',
-                'api_server': 'render.com'
-            })
-            logger.info(f"✅ Успешная авторизация через LDAP: {username}")
-            return jsonify(result), 200
-        else:
-            # Ошибка LDAP сервера
-            logger.warning(f"⚠️ Ошибка LDAP для {username}: {ldap_result.get('error')}")
-            
-            # Детальная информация об ошибке
-            error_response = {
-                'success': False,
-                'error': ldap_result.get('error', 'Ошибка авторизации'),
-                'details': ldap_result.get('details', ''),
-                'timestamp': datetime.now().isoformat(),
-                'ldap_server': Config.LDAP_SERVER_URL,
-                'suggestion': 'Проверьте доступность LDAP сервера и правильность URL'
-            }
-            
-            # Определяем код ответа
-            if 'пароль' in str(ldap_result.get('error', '')).lower() or 'credential' in str(ldap_result.get('error', '')).lower():
-                status_code = 401  # Неверные учетные данные
-            elif 'timeout' in str(ldap_result.get('error', '')).lower() or 'connection' in str(ldap_result.get('error', '')).lower():
-                status_code = 503  # Сервер недоступен
-            else:
-                status_code = 500  # Внутренняя ошибка
-            
-            return jsonify(error_response), status_code
             
     except Exception as e:
-        logger.error(f"❌ Критическая ошибка в /api/auth/login: {e}")
+        logger.error(f"💥 Критическая ошибка в auth_login: {e}")
         return jsonify({
             'success': False,
             'error': 'Внутренняя ошибка сервера',
-            'timestamp': datetime.now().isoformat(),
-            'error_details': str(e)[:200]
+            'error_code': 'SERVER_ERROR',
+            'timestamp': datetime.now().isoformat()
         }), 500
 
 @app.route('/api/region/<region_code>', methods=['GET'])
 def get_region_data(region_code):
     """
     🗺️ Получение данных региона
+    Подключается к локальному Data API если настроено
     """
     try:
         region_code = region_code.upper()
-        logger.info(f"🗺️ Запрос данных региона: {region_code}")
+        logger.info(f"🗺️ Запрос региона: {region_code}")
         
-        sources_tried = []
-        
-        # 🔧 ШАГ 1: Пробуем локальный Data API (HTTPS)
+        # 🔧 Пробуем локальный Data API
         if Config.DATA_API_URL:
-            sources_tried.append('local_data_api_https')
             data_url = f"{Config.DATA_API_URL}/api/region/{region_code}"
-            
-            result = make_secure_request(data_url)
+            result = make_secure_request(data_url, method='GET')
             
             if result['success']:
                 data = result['data']
                 data.update({
-                    'source': 'local_data_api_https',
+                    'source': 'external_data_api',
                     'api_timestamp': datetime.now().isoformat(),
-                    'sources_tried': sources_tried,
                     'data_server': Config.DATA_API_URL
                 })
-                logger.info(f"✅ Данные получены из локального HTTPS API для {region_code}")
+                logger.info(f"✅ Данные получены из Data API")
                 return jsonify(data)
         
-        # 🔧 ШАГ 2: Фолбэк данные
-        sources_tried.append('fallback')
-        if region_code in Config.FALLBACK_DATA:
-            data = Config.FALLBACK_DATA[region_code].copy()
+        # 📌 Фолбэк данные
+        if region_code in Config.FALLBACK_REGIONS:
+            data = Config.FALLBACK_REGIONS[region_code].copy()
             data.update({
                 'success': True,
                 'region_code': region_code,
-                'timestamp': datetime.now().strftime("%H:%M:%S"),
-                'non_priority': '📶 Технологии: данные временно недоступны',
-                'is_mock': True,
-                'source': 'fallback',
-                'sources_tried': sources_tried,
+                'is_fallback': True,
+                'source': 'fallback_data',
                 'api_timestamp': datetime.now().isoformat(),
-                'warning': 'Используются тестовые данные. Настройте DATA_API_URL.'
+                'warning': 'Используются тестовые данные' if not Config.DATA_API_URL else 'Data API недоступен'
             })
-            logger.warning(f"⚠️ Используются фолбэк данные для {region_code}")
+            logger.info(f"📋 Используются фолбэк данные для {region_code}")
             return jsonify(data)
         
-        # 🔧 ШАГ 3: Регион не найден
-        logger.error(f"❌ Регион не найден: {region_code}")
+        # ❌ Регион не найден
         return jsonify({
             'success': False,
             'error': f'Регион {region_code} не найден',
-            'sources_tried': sources_tried,
-            'timestamp': datetime.now().isoformat(),
-            'suggestion': 'Настройте DATA_API_URL или добавьте регион в фолбэк данные'
+            'available_regions': list(Config.FALLBACK_REGIONS.keys()),
+            'timestamp': datetime.now().isoformat()
         }), 404
         
     except Exception as e:
-        logger.error(f"❌ Ошибка получения данных региона {region_code}: {e}")
+        logger.error(f"❌ Ошибка получения региона {region_code}: {e}")
         return jsonify({
             'success': False,
-            'error': str(e),
+            'error': 'Ошибка получения данных',
             'region_code': region_code,
             'timestamp': datetime.now().isoformat()
         }), 500
 
-@app.route('/api/test', methods=['GET'])
-def test_connection():
+@app.route('/api/test/ldap', methods=['GET'])
+def test_ldap_connection():
     """
-    🧪 Тестовый endpoint
-    Проверяет работу API и подключение ко всем сервисам
+    🧪 Тестирование подключения к LDAP серверу
     """
     test_results = {
-        'api_status': 'running',
+        'test': 'ldap_connection_test',
         'timestamp': datetime.now().isoformat(),
-        'server': 'dostupnost_api_render',
-        'protocol': 'https',
         'config': {
             'ldap_server_url': Config.LDAP_SERVER_URL,
-            'data_api_url': Config.DATA_API_URL,
-            'has_ldap_config': bool(Config.LDAP_SERVER_URL),
-            'has_data_api_config': bool(Config.DATA_API_URL),
-            'ssl_verification': Config.VERIFY_SSL
+            'request_timeout': Config.REQUEST_TIMEOUT,
+            'verify_ssl': Config.VERIFY_SSL,
+            'fallback_mode': Config.FALLBACK_MODE
         },
-        'services': {},
-        'endpoints': [
-            {'method': 'POST', 'path': '/api/auth/login', 'description': 'Аутентификация'},
-            {'method': 'GET', 'path': '/api/region/{code}', 'description': 'Данные региона'},
-            {'method': 'GET', 'path': '/api/test', 'description': 'Тест системы'},
-            {'method': 'GET', 'path': '/api/health', 'description': 'Проверка здоровья'}
-        ]
+        'tests': {}
     }
     
-    # Проверяем LDAP сервер
+    # Тест 1: Проверка конфигурации
+    test_results['tests']['config_check'] = {
+        'passed': bool(Config.LDAP_SERVER_URL),
+        'message': 'LDAP_SERVER_URL настроен' if Config.LDAP_SERVER_URL else 'LDAP_SERVER_URL не настроен',
+        'url': Config.LDAP_SERVER_URL or 'не указан'
+    }
+    
+    # Тест 2: Пинг LDAP сервера (если настроен)
     if Config.LDAP_SERVER_URL:
-        ldap_health_url = f"{Config.LDAP_SERVER_URL}/api/ldap/health"
-        ldap_check = make_secure_request(ldap_health_url)
-        test_results['services']['ldap'] = {
-            'url': Config.LDAP_SERVER_URL,
-            'status': 'up' if ldap_check['success'] else 'down',
-            'response': ldap_check
-        }
+        try:
+            # Пробуем получить health status от LDAP сервера
+            health_url = Config.LDAP_SERVER_URL.replace('/api/ldap/auth', '/api/ldap/health')
+            
+            result = make_secure_request(health_url, method='GET')
+            
+            test_results['tests']['ldap_health'] = {
+                'passed': result['success'],
+                'message': result.get('error', 'Успешно') if not result['success'] else 'LDAP сервер доступен',
+                'response_time': result.get('response_time'),
+                'status_code': result.get('status_code')
+            }
+        except Exception as e:
+            test_results['tests']['ldap_health'] = {
+                'passed': False,
+                'message': f'Ошибка теста: {str(e)}'
+            }
+    
+    # Тест 3: Тестовая аутентификация
+    test_results['tests']['test_auth'] = {
+        'available': True,
+        'test_users': list(Config.FALLBACK_USERS.keys()) if Config.FALLBACK_MODE else [],
+        'message': 'Фолбэк режим включен' if Config.FALLBACK_MODE else 'Только LDAP'
+    }
+    
+    # Общая оценка
+    passed_tests = [t for t in test_results['tests'].values() if t.get('passed', False)]
+    if len(passed_tests) == len(test_results['tests']):
+        test_results['overall'] = 'PASSED'
+    elif len(passed_tests) > 0:
+        test_results['overall'] = 'PARTIAL'
     else:
-        test_results['services']['ldap'] = {
-            'status': 'not_configured',
-            'error': 'LDAP_SERVER_URL не настроен'
-        }
-    
-    # Проверяем Data API
-    if Config.DATA_API_URL:
-        data_test_url = f"{Config.DATA_API_URL}/api/test"
-        data_check = make_secure_request(data_test_url)
-        test_results['services']['data_api'] = {
-            'url': Config.DATA_API_URL,
-            'status': 'up' if data_check['success'] else 'down',
-            'response': data_check
-        }
-    else:
-        test_results['services']['data_api'] = {
-            'status': 'not_configured',
-            'error': 'DATA_API_URL не настроен'
-        }
-    
-    # Определяем общий статус
-    configured_services = [s for s in test_results['services'].values() 
-                          if s.get('status') != 'not_configured']
-    
-    if not configured_services:
-        overall_status = 'not_configured'
-    elif all(s.get('status') == 'up' for s in configured_services):
-        overall_status = 'healthy'
-    elif any(s.get('status') == 'up' for s in configured_services):
-        overall_status = 'degraded'
-    else:
-        overall_status = 'down'
-    
-    test_results['overall_status'] = overall_status
+        test_results['overall'] = 'FAILED'
     
     return jsonify(test_results)
+
+@app.route('/api/test', methods=['GET'])
+def test_api():
+    """🧪 Полный тест API сервера"""
+    return jsonify({
+        'service': 'dostupnost_api',
+        'status': 'running',
+        'timestamp': datetime.now().isoformat(),
+        'version': '2.0.0',
+        'config_summary': {
+            'ldap_configured': bool(Config.LDAP_SERVER_URL),
+            'data_api_configured': bool(Config.DATA_API_URL),
+            'fallback_mode': Config.FALLBACK_MODE,
+            'request_timeout': Config.REQUEST_TIMEOUT
+        },
+        'endpoints': [
+            {'method': 'POST', 'path': '/api/auth/login', 'desc': 'Аутентификация'},
+            {'method': 'GET', 'path': '/api/region/{code}', 'desc': 'Данные региона'},
+            {'method': 'GET', 'path': '/api/test/ldap', 'desc': 'Тест LDAP'},
+            {'method': 'GET', 'path': '/api/test', 'desc': 'Тест API'},
+            {'method': 'GET', 'path': '/api/health', 'desc': 'Здоровье'}
+        ],
+        'available_regions': list(Config.FALLBACK_REGIONS.keys()),
+        'instructions': {
+            'setup_ldap': 'Настройте LDAP_SERVER_URL = https://ваш_ip:8443/api/ldap/auth',
+            'test_auth': 'Используйте test@t2.ru / Test123! для теста'
+        }
+    })
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
@@ -392,10 +468,13 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'service': 'dostupnost_api',
-        'version': '2.0.0',
-        'timestamp': datetime.now().isoformat(),
         'environment': 'production',
-        'features': ['https', 'ldap_auth', 'region_data']
+        'timestamp': datetime.now().isoformat(),
+        'checks': {
+            'api_server': 'running',
+            'ldap_configured': bool(Config.LDAP_SERVER_URL),
+            'fallback_available': Config.FALLBACK_MODE
+        }
     })
 
 @app.route('/')
@@ -405,59 +484,71 @@ def home():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>🌐 Dostupnost API (HTTPS)</title>
+        <title>🌐 Dostupnost API</title>
         <meta charset="utf-8">
         <style>
             body {{ font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }}
             .card {{ background: #f5f5f5; padding: 20px; margin: 20px 0; border-radius: 8px; }}
-            .success {{ color: #4CAF50; }}
-            .warning {{ color: #FF9800; }}
-            .error {{ color: #f44336; }}
+            .success {{ color: #4CAF50; font-weight: bold; }}
+            .warning {{ color: #FF9800; font-weight: bold; }}
+            .error {{ color: #f44336; font-weight: bold; }}
             code {{ background: #eee; padding: 2px 6px; border-radius: 3px; }}
             pre {{ background: #f8f8f8; padding: 10px; border-radius: 5px; overflow-x: auto; }}
         </style>
     </head>
     <body>
         <h1>🌐 Dostupnost API Server</h1>
-        <p>HTTPS API сервер для Android приложения мониторинга доступности регионов</p>
+        <p>API сервер для Android приложения мониторинга доступности</p>
         
         <div class="card">
-            <h2>📱 Для Android приложения</h2>
-            <p>В файле <code>ApiClient.kt</code> укажите HTTPS URL:</p>
-            <pre>private const val BASE_URL = "https://dostupnost.onrender.com/"</pre>
+            <h2>⚙️ Конфигурация</h2>
+            <p>LDAP сервер: <span class="{'success' if Config.LDAP_SERVER_URL else 'error'}">
+                {Config.LDAP_SERVER_URL or '❌ НЕ НАСТРОЕН'}
+            </span></p>
+            <p>Data API: <span class="{'success' if Config.DATA_API_URL else 'warning'}">
+                {Config.DATA_API_URL or '⚠️ ОПЦИОНАЛЬНО'}
+            </span></p>
+            <p>Фолбэк режим: <span class="{'success' if Config.FALLBACK_MODE else 'warning'}">
+                {'✅ ВКЛЮЧЕН' if Config.FALLBACK_MODE else '⚠️ ВЫКЛЮЧЕН'}
+            </span></p>
         </div>
         
         <div class="card">
-            <h2>⚙️ Конфигурация Render.com</h2>
-            <p>В Dashboard Render.com настройте переменные окружения:</p>
+            <h2>🔗 Основные Endpoints</h2>
             <ul>
-                <li><code>LDAP_SERVER_URL = https://ваш_ip:8443</code> <span class="{'success' if Config.LDAP_SERVER_URL else 'error'}">({'Настроено' if Config.LDAP_SERVER_URL else 'Не настроено'})</span></li>
-                <li><code>DATA_API_URL = https://ваш_ip:8444</code> <span class="{'success' if Config.DATA_API_URL else 'warning'}">({'Настроено' if Config.DATA_API_URL else 'Опционально'})</span></li>
-            </ul>
-            <p><em>Используйте реальный внешний IP адрес вашего компьютера</em></p>
-        </div>
-        
-        <div class="card">
-            <h2>🔗 Основные endpoints</h2>
-            <ul>
-                <li><code>POST /api/auth/login</code> - Авторизация через LDAP</li>
-                <li><code>GET /api/region/&lt;code&gt;</code> - Данные региона</li>
-                <li><code>GET /api/test</code> - Тест системы</li>
+                <li><code>POST /api/auth/login</code> - Аутентификация через LDAP</li>
+                <li><code>GET /api/region/{code}</code> - Данные региона (BRT, OMS, TEST)</li>
+                <li><code>GET /api/test/ldap</code> - Тест подключения к LDAP</li>
+                <li><code>GET /api/test</code> - Полный тест системы</li>
                 <li><code>GET /api/health</code> - Проверка здоровья</li>
             </ul>
         </div>
         
         <div class="card">
-            <h2>🔧 Проверка работы</h2>
-            <p><a href="/api/test">/api/test</a> - Полный тест всех сервисов</p>
-            <p><a href="/api/health">/api/health</a> - Проверка здоровья API</p>
+            <h2>🔧 Настройка LDAP сервера</h2>
+            <p>1. Убедитесь что LDAP сервер запущен на вашем компьютере</p>
+            <p>2. Откройте порт 8443 на роутере:</p>
+            <pre>Внешний порт: 8443 → Внутренний IP: [ваш IP]:8443</pre>
+            <p>3. Узнайте ваш внешний IP:</p>
+            <pre>curl ifconfig.me</pre>
+            <p>4. В Render.com Dashboard добавьте переменную:</p>
+            <pre>LDAP_SERVER_URL = https://[ВАШ_ВНЕШНИЙ_IP]:8443/api/ldap/auth</pre>
         </div>
         
         <div class="card">
-            <h2>⚠️ Важная информация</h2>
-            <p>1. LDAP сервер использует самоподписанный SSL сертификат</p>
-            <p>2. Для работы требуется открыть порты 8443 и 8444 на роутере</p>
-            <p>3. Android может требовать доверия к самоподписанному сертификату</p>
+            <h2>🧪 Тестирование</h2>
+            <p><a href="/api/test">Полный тест системы</a></p>
+            <p><a href="/api/test/ldap">Тест LDAP подключения</a></p>
+            <p><a href="/api/health">Проверка здоровья</a></p>
+        </div>
+        
+        <div class="card">
+            <h2>📱 Тестовые пользователи (фолбэк)</h2>
+            <ul>
+                <li><code>admin</code> / <code>admin123</code></li>
+                <li><code>test@t2.ru</code> / <code>Test123!</code></li>
+                <li><code>danil.vasilchenko@t2.ru</code> / <code>Daniil2024!</code></li>
+            </ul>
         </div>
     </body>
     </html>
@@ -469,36 +560,42 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     
     print("=" * 70)
-    print("🌐 DOSTUPNOST API СЕРВЕР НА RENDER.COM (HTTPS)")
+    print("🌐 DOSTUPNOST API СЕРВЕР НА RENDER.COM")
+    print("Подключение к локальному LDAP серверу")
     print("=" * 70)
     
-    print("\n⚙️  КОНФИГУРАЦИЯ:")
-    print(f"   • LDAP сервер:  {Config.LDAP_SERVER_URL or '❌ НЕ НАСТРОЕНО'}")
-    print(f"   • Data API:     {Config.DATA_API_URL or '⚠️  ОПЦИОНАЛЬНО'}")
-    print(f"   • SSL verify:   {'Да' if Config.VERIFY_SSL else 'Нет (самоподписанные)'}")
+    print(f"\n⚙️  ТЕКУЩАЯ КОНФИГУРАЦИЯ:")
+    print(f"   • LDAP сервер:    {Config.LDAP_SERVER_URL or '❌ НЕ НАСТРОЕН'}")
+    print(f"   • Data API:       {Config.DATA_API_URL or '⚠️  ОПЦИОНАЛЬНО'}")
+    print(f"   • Таймаут:        {Config.REQUEST_TIMEOUT} секунд")
+    print(f"   • Фолбэк режим:   {'✅ ВКЛЮЧЕН' if Config.FALLBACK_MODE else '⚠️ ВЫКЛЮЧЕН'}")
+    print(f"   • Проверка SSL:   {'✅ ВКЛЮЧЕНА' if Config.VERIFY_SSL else '⚠️ ОТКЛЮЧЕНА (самоподписанные)'}")
     
-    print("\n📋 ОСНОВНЫЕ ENDPOINTS:")
-    print("   • POST /api/auth/login            - Авторизация")
-    print("   • GET  /api/region/{code}        - Данные региона")
-    print("   • GET  /api/test                 - Тест системы")
-    print("   • GET  /api/health               - Проверка здоровья")
+    print(f"\n📋 ДОСТУПНЫЕ ENDPOINTS:")
+    print(f"   • POST /api/auth/login    - Аутентификация")
+    print(f"   • GET  /api/region/BRT    - Данные Бурятии")
+    print(f"   • GET  /api/test/ldap     - Тест LDAP")
+    print(f"   • GET  /api/test          - Тест системы")
+    print(f"   • GET  /api/health        - Проверка здоровья")
     
-    print("\n🔧 ДЛЯ НАСТРОЙКИ:")
-    print("   1. Сгенерируйте SSL сертификаты: python generate_certs.py")
-    print("   2. Запустите ldap_server.py на своем компьютере")
-    print("   3. Откройте порты 8443 и 8444 на роутере")
-    print("   4. В Render.com Dashboard добавьте переменные:")
-    print("      - LDAP_SERVER_URL = https://[ВАШ_IP]:8443")
-    print("      - DATA_API_URL = https://[ВАШ_IP]:8444")
+    print(f"\n🔧 ИНСТРУКЦИЯ ДЛЯ НАСТРОЙКИ:")
+    print(f"   1. Запустите LDAP сервер на вашем компьютере")
+    print(f"   2. Откройте порт 8443 на роутере:")
+    print(f"      Внешний порт 8443 → Внутренний IP:8443")
+    print(f"   3. Узнайте ваш внешний IP:")
+    print(f"      На компьютере выполните: curl ifconfig.me")
+    print(f"   4. В Render.com Dashboard добавьте:")
+    print(f"      LDAP_SERVER_URL = https://[ВАШ_IP]:8443/api/ldap/auth")
     
-    print("\n📱 ДЛЯ ANDROID:")
-    print("   Убедитесь что BASE_URL в ApiClient.kt:")
-    print('   private const val BASE_URL = "https://dostupnost.onrender.com/"')
+    print(f"\n📱 ДЛЯ ANDROID ПРИЛОЖЕНИЯ:")
+    print(f"   В файле ApiClient.kt укажите:")
+    print(f'   private const val BASE_URL = "https://ваш-сервис.onrender.com/"')
     
-    print("\n🔐 SSL ВАЖНО:")
-    print("   • Самоподписанные сертификаты требуют verify=False")
-    print("   • Для продакшена используйте Let's Encrypt")
+    print(f"\n⚠️  ВАЖНЫЕ ЗАМЕЧАНИЯ:")
+    print(f"   • LDAP сервер использует самоподписанный SSL сертификат")
+    print(f"   • Для запросов установлен verify=False")
+    print(f"   • При недоступности LDAP работает фолбэк режим")
     print("=" * 70)
     
-    print(f"🚀 Запуск API сервера на порту {port}...")
+    print(f"\n🚀 Запуск API сервера на порту {port}...")
     app.run(host='0.0.0.0', port=port, debug=False)
