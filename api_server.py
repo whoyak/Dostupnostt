@@ -18,20 +18,31 @@ CORS(app)  # Разрешаем CORS для всех доменов
 # === LDAP GATEWAY КОНФИГУРАЦИЯ ===
 # Эти настройки нужны для доменной авторизации
 LDAP_GATEWAY_ENABLED = True
+
 # 🔗 GitHub репозиторий с данными
 GITHUB_REPO = os.environ.get('GITHUB_REPO', 'whoyak/region-data-cache')
 GITHUB_BRANCH = os.environ.get('GITHUB_BRANCH', 'main')
     
 # 🔑 GitHub токен (берется из переменных окружения Render.com)
-# В Render.com Dashboard добавьте переменную GITHUB_TOKEN
 GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN', '')
+
+# === LDAP НАСТРОЙКИ ===
+# URL вашего локального LDAP сервера (будет настроен позже)
+# Формат: https://ВАШ_ВНЕШНИЙ_IP:8443/api/ldap/auth
+LDAP_SERVER_URL = os.environ.get('LDAP_SERVER_URL', '')
+LDAP_REQUEST_TIMEOUT = int(os.environ.get('LDAP_REQUEST_TIMEOUT', 10))
+
+# Режимы работы авторизации
+AUTH_MODE = os.environ.get('AUTH_MODE', 'mixed')  # 'mixed', 'ldap_only', 'fallback_only'
 
 # Фолбэк пользователи (если LDAP недоступен)
 FALLBACK_USERS = {
     "operator": "operator123",
     "viewer": "viewonly",
     "test": "test123",
-    "admin": "admin"  # Добавил для тестирования
+    "admin": "admin",
+    "danil.vasilchenko": "ваш_пароль",  # Замените на реальный пароль
+    "danil": "ваш_пароль"
 }
 
 # Конфигурация
@@ -43,6 +54,88 @@ cache = {
     'data': {},
     'timestamp': datetime.min
 }
+
+def make_ldap_request(username, password):
+    """Отправляет запрос на локальный LDAP сервер"""
+    try:
+        if not LDAP_SERVER_URL:
+            return {
+                'success': False,
+                'error': 'LDAP сервер не настроен',
+                'error_code': 'LDAP_NOT_CONFIGURED'
+            }
+        
+        # Подготавливаем данные для LDAP
+        ldap_data = {
+            'username': username,
+            'password': password,
+            'timestamp': datetime.now().isoformat(),
+            'source_ip': request.remote_addr
+        }
+        
+        # Отправляем запрос к локальному LDAP серверу
+        response = requests.post(
+            LDAP_SERVER_URL,
+            json=ldap_data,
+            timeout=LDAP_REQUEST_TIMEOUT,
+            verify=False  # Для самоподписанных сертификатов
+        )
+        
+        if response.status_code == 200:
+            return {
+                'success': True,
+                'data': response.json(),
+                'auth_source': 'ldap_direct',
+                'response_time': response.elapsed.total_seconds()
+            }
+        else:
+            return {
+                'success': False,
+                'error': f'LDAP сервер вернул {response.status_code}',
+                'error_code': f'LDAP_{response.status_code}',
+                'response_text': response.text[:200]
+            }
+            
+    except requests.exceptions.Timeout:
+        return {
+            'success': False,
+            'error': f'Таймаут подключения к LDAP серверу ({LDAP_REQUEST_TIMEOUT}с)',
+            'error_code': 'LDAP_TIMEOUT',
+            'details': 'LDAP сервер не ответил. Проверьте доступность и порты.'
+        }
+    except requests.exceptions.ConnectionError:
+        return {
+            'success': False,
+            'error': 'Не удалось подключиться к LDAP серверу',
+            'error_code': 'LDAP_CONNECTION_ERROR',
+            'details': 'Проверьте URL и доступность LDAP сервера.'
+        }
+    except Exception as e:
+        return {
+            'success': False,
+            'error': f'Ошибка LDAP запроса: {str(e)}',
+            'error_code': 'LDAP_REQUEST_ERROR'
+        }
+
+def check_fallback_auth(username, password):
+    """Проверка учетных данных в фолбэк режиме"""
+    if username in FALLBACK_USERS:
+        if FALLBACK_USERS[username] == password:
+            return {
+                'success': True,
+                'username': username,
+                'display_name': username.split('@')[0] if '@' in username else username,
+                'email': username if '@' in username else f'{username}@t2.ru',
+                'department': 'Технический отдел',
+                'title': 'Пользователь системы',
+                'auth_source': 'fallback_mode'
+            }
+    
+    return {
+        'success': False,
+        'error': 'Неверные учетные данные',
+        'error_code': 'INVALID_CREDENTIALS'
+    }
 
 def fetch_from_github(filename):
     """Загружает данные из GitHub"""
@@ -83,7 +176,10 @@ def test_connection():
         'message': 'API Dostupnost работает нормально',
         'timestamp': datetime.now().isoformat(),
         'version': '1.0.0',
-        'features': ['current_data', 'full_history', 'historical_view']
+        'features': ['current_data', 'full_history', 'historical_view', 'ldap_auth'],
+        'auth_modes': ['ldap', 'fallback', 'mixed'],
+        'current_auth_mode': AUTH_MODE,
+        'ldap_configured': bool(LDAP_SERVER_URL)
     })
 
 @app.route('/api/region/<region_code>', methods=['GET'])
@@ -231,6 +327,7 @@ def get_historical_data(region_code, timestamp):
                 pass
 
             closest_item = None
+            closest_item_time = None
             if target_time:
                 for item in history_response['history']:
                     item_time = datetime.fromisoformat(item.get('full_timestamp', '2000-01-01').replace('Z', '+00:00'))
@@ -276,149 +373,195 @@ def get_historical_data(region_code, timestamp):
             'timestamp': timestamp
         }), 500
 
-
 @app.route('/api/auth/login', methods=['POST'])
 def auth_login():
-    """Аутентификация через GitHub файлы (LDAP Gateway)"""
+    """Аутентификация через LDAP или фолбэк"""
     try:
         data = request.json
         username = data.get('username', '').strip()
         password = data.get('password', '').strip()
 
         if not username or not password:
-            return jsonify({'success': False, 'error': 'Missing credentials'}), 400
-
-        print(f"🔐 Auth request for: {username}")
-
-        # Для быстрого теста - админ
-        if username.lower() == 'admin' and password == 'admin':
-            print(f"✅ Admin login (test)")
             return jsonify({
-                'success': True,
-                'username': 'admin',
-                'display_name': 'Администратор',
-                'auth_source': 'test',
-                'timestamp': datetime.now().isoformat()
-            })
+                'success': False,
+                'error': 'Требуется имя пользователя и пароль',
+                'error_code': 'MISSING_CREDENTIALS'
+            }), 400
 
-        # 1. Создаем запрос для LDAP Gateway через GitHub
-        request_id = str(uuid.uuid4())[:8]
-        auth_request = {
-            'request_id': request_id,
-            'username': username,
-            'password': password,  # ⚠️ В открытом виде - нужно шифровать!
-            'created_at': datetime.now().isoformat(),
-            'source_ip': request.remote_addr,
-            'processed': False
-        }
+        print(f"🔐 Auth request for: {username} (mode: {AUTH_MODE})")
 
-        try:
-            # 2. Загружаем текущие запросы с GitHub
-            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/ldap_requests.json"
-            headers = {
-                'Authorization': f'token {GITHUB_TOKEN}',
-                'Accept': 'application/vnd.github.v3+json'
-            }
-
-            response = requests.get(url, headers=headers, timeout=10)
-            current_requests = []
-            sha = None
-
-            if response.status_code == 200:
-                content = base64.b64decode(response.json()['content']).decode('utf-8')
-                current_requests = json.loads(content)
-                sha = response.json()['sha']
-
-            # 3. Добавляем новый запрос
-            current_requests.append(auth_request)
-
-            # 4. Сохраняем обратно на GitHub
-            content_encoded = base64.b64encode(
-                json.dumps(current_requests, indent=2).encode('utf-8')
-            ).decode('utf-8')
-
-            payload = {
-                'message': f'Auth request: {username}',
-                'content': content_encoded,
-                'branch': GITHUB_BRANCH
-            }
-            if sha:
-                payload['sha'] = sha
-
-            put_response = requests.put(url, headers=headers, json=payload, timeout=10)
-
-            if put_response.status_code in [200, 201]:
-                print(f"📝 Запрос {request_id} отправлен в очередь LDAP Gateway")
-            else:
-                print(f"⚠️ Ошибка сохранения запроса: {put_response.status_code}")
+        # 📌 Режим работы в зависимости от AUTH_MODE
+        if AUTH_MODE == 'ldap_only' or AUTH_MODE == 'mixed':
+            # Пробуем LDAP аутентификацию
+            ldap_result = make_ldap_request(username, password)
+            
+            if ldap_result['success']:
+                print(f"✅ LDAP auth successful: {username}")
+                response_data = ldap_result['data']
+                response_data.update({
+                    'api_server': 'dostupnost_api_render',
+                    'auth_flow': 'ldap_direct',
+                    'timestamp': datetime.now().isoformat()
+                })
+                return jsonify(response_data)
+            
+            # Если LDAP не сработал, но режим mixed - пробуем фолбэк
+            if AUTH_MODE == 'mixed':
+                print(f"⚠️ LDAP failed, trying fallback: {ldap_result.get('error')}")
+                fallback_result = check_fallback_auth(username, password)
+                
+                if fallback_result['success']:
+                    fallback_result.update({
+                        'api_server': 'dostupnost_api_render',
+                        'auth_flow': 'fallback_after_ldap',
+                        'warning': 'Используется фолбэк аутентификация. LDAP сервер недоступен.',
+                        'ldap_error': ldap_result.get('error'),
+                        'timestamp': datetime.now().isoformat()
+                    })
+                    print(f"✅ Fallback auth successful: {username}")
+                    return jsonify(fallback_result)
+                
+                # Если фолбэк тоже не сработал
                 return jsonify({
                     'success': False,
-                    'error': 'Не удалось отправить запрос авторизации'
-                }), 500
-
-        except Exception as e:
-            print(f"⚠️ Ошибка работы с GitHub API: {str(e)}")
-            # Продолжаем без GitHub - используем тестовых пользователей
-            pass
-
-        # Для быстрого теста - тестовые пользователи
-        TEST_USERS = {
-            "danil.vasilchenko": "ваш_пароль",
-            "danil": "ваш_пароль",
-            "operator": "operator123",
-            "viewer": "viewonly"
-        }
-
-        if username in TEST_USERS and TEST_USERS[username] == password:
-            print(f"✅ Test user login successful: {username}")
+                    'error': 'Неверные учетные данные',
+                    'error_code': 'INVALID_CREDENTIALS',
+                    'timestamp': datetime.now().isoformat()
+                }), 401
+            else:
+                # Режим ldap_only - возвращаем ошибку LDAP
+                return jsonify({
+                    'success': False,
+                    'error': ldap_result.get('error', 'Ошибка LDAP аутентификации'),
+                    'error_code': ldap_result.get('error_code', 'LDAP_ERROR'),
+                    'details': ldap_result.get('details', ''),
+                    'timestamp': datetime.now().isoformat()
+                }), 401
+        
+        # 📌 Режим fallback_only
+        elif AUTH_MODE == 'fallback_only':
+            fallback_result = check_fallback_auth(username, password)
+            
+            if fallback_result['success']:
+                fallback_result.update({
+                    'api_server': 'dostupnost_api_render',
+                    'auth_flow': 'fallback_only',
+                    'timestamp': datetime.now().isoformat()
+                })
+                print(f"✅ Fallback-only auth successful: {username}")
+                return jsonify(fallback_result)
+            
             return jsonify({
-                'success': True,
-                'username': username,
-                'display_name': username.title(),
-                'auth_source': 'test',
+                'success': False,
+                'error': 'Неверные учетные данные',
+                'error_code': 'INVALID_CREDENTIALS',
                 'timestamp': datetime.now().isoformat()
-            })
-
-        return jsonify({
-            'success': False,
-            'error': 'Неверный логин или пароль',
-            'hint': 'Используйте тестовые учетки: admin/admin, operator/operator123'
-        }), 401
+            }), 401
 
     except Exception as e:
         print(f"❌ Auth endpoint error: {str(e)}")
         return jsonify({
             'success': False,
-            'error': f'Authentication error: {str(e)}'
+            'error': f'Authentication error: {str(e)}',
+            'error_code': 'SERVER_ERROR',
+            'timestamp': datetime.now().isoformat()
         }), 500
+
+@app.route('/api/auth/ldap/test', methods=['GET'])
+def test_ldap_connection():
+    """Тест подключения к LDAP серверу"""
+    test_results = {
+        'test': 'ldap_connection_test',
+        'timestamp': datetime.now().isoformat(),
+        'config': {
+            'ldap_server_url': LDAP_SERVER_URL,
+            'auth_mode': AUTH_MODE,
+            'request_timeout': LDAP_REQUEST_TIMEOUT,
+            'fallback_users_count': len(FALLBACK_USERS)
+        },
+        'tests': {}
+    }
+    
+    # Тест 1: Проверка конфигурации
+    test_results['tests']['config_check'] = {
+        'passed': bool(LDAP_SERVER_URL),
+        'message': 'LDAP сервер настроен' if LDAP_SERVER_URL else 'LDAP сервер не настроен',
+        'url': LDAP_SERVER_URL or 'не указан'
+    }
+    
+    # Тест 2: Пинг LDAP сервера (если настроен)
+    if LDAP_SERVER_URL:
+        try:
+            # Пробуем получить health status от LDAP сервера
+            health_url = LDAP_SERVER_URL.replace('/api/ldap/auth', '/health')
+            
+            response = requests.get(health_url, timeout=5, verify=False)
+            
+            test_results['tests']['ldap_health'] = {
+                'passed': response.status_code == 200,
+                'message': 'LDAP сервер доступен' if response.status_code == 200 else f'LDAP сервер недоступен: {response.status_code}',
+                'status_code': response.status_code,
+                'response_time': response.elapsed.total_seconds() if hasattr(response, 'elapsed') else None
+            }
+        except Exception as e:
+            test_results['tests']['ldap_health'] = {
+                'passed': False,
+                'message': f'Ошибка подключения: {str(e)}'
+            }
+    
+    # Тест 3: Проверка фолбэк пользователей
+    test_results['tests']['fallback_users'] = {
+        'passed': len(FALLBACK_USERS) > 0,
+        'message': f'{len(FALLBACK_USERS)} фолбэк пользователей настроено',
+        'users': list(FALLBACK_USERS.keys())
+    }
+    
+    # Общая оценка
+    passed_tests = [t for t in test_results['tests'].values() if t.get('passed', False)]
+    if AUTH_MODE == 'fallback_only' and test_results['tests']['fallback_users']['passed']:
+        test_results['overall'] = 'PASSED'
+    elif AUTH_MODE == 'ldap_only' and test_results['tests']['ldap_health']['passed']:
+        test_results['overall'] = 'PASSED'
+    elif AUTH_MODE == 'mixed' and (test_results['tests']['ldap_health']['passed'] or test_results['tests']['fallback_users']['passed']):
+        test_results['overall'] = 'PASSED'
+    else:
+        test_results['overall'] = 'FAILED'
+    
+    return jsonify(test_results)
 
 @app.route('/api/auth/health', methods=['GET'])
 def auth_health():
     """Проверка доступности авторизации"""
     ldap_status = 'unknown'
-
-    try:
-        # Проверяем статус LDAP Gateway через GitHub
-        status_url = f"{GITHUB_RAW_BASE}ldap_status.json"
-        response = requests.get(status_url, timeout=5)
-
-        if response.status_code == 200:
-            status_data = response.json()
-            ldap_status = status_data.get('status', 'unknown')
-        else:
+    
+    if LDAP_SERVER_URL:
+        try:
+            response = requests.get(
+                LDAP_SERVER_URL.replace('/api/ldap/auth', '/health'),
+                timeout=3,
+                verify=False
+            )
+            if response.status_code == 200:
+                ldap_status = 'available'
+            else:
+                ldap_status = 'unavailable'
+        except:
             ldap_status = 'unavailable'
-    except:
-        ldap_status = 'unavailable'
 
     return jsonify({
         'success': True,
-        'ldap_gateway': {
-            'enabled': LDAP_GATEWAY_ENABLED,
-            'status': ldap_status,
-            'method': 'github_files'
+        'auth': {
+            'mode': AUTH_MODE,
+            'ldap_configured': bool(LDAP_SERVER_URL),
+            'ldap_status': ldap_status,
+            'fallback_users': len(FALLBACK_USERS),
+            'fallback_available': AUTH_MODE in ['mixed', 'fallback_only']
         },
-        'fallback_users': len(FALLBACK_USERS),
-        'timestamp': datetime.now().isoformat()
+        'timestamp': datetime.now().isoformat(),
+        'instructions': {
+            'setup_ldap': 'Установите LDAP_SERVER_URL = https://ваш_внешний_ip:8443/api/ldap/auth',
+            'test_users': 'Используйте admin/admin для теста'
+        }
     })
 
 @app.route('/api/region/<region_code>/refresh', methods=['POST'])
@@ -503,9 +646,97 @@ def health_check():
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
         'service': 'dostupnost-api',
-        'features': ['current_data', 'historical_data', 'full_history']
+        'features': ['current_data', 'historical_data', 'full_history', 'ldap_auth'],
+        'auth': {
+            'mode': AUTH_MODE,
+            'ldap_configured': bool(LDAP_SERVER_URL),
+            'fallback_available': True
+        }
     })
+
+@app.route('/')
+def home():
+    """Домашняя страница API"""
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>🌐 Dostupnost API Server</title>
+        <meta charset="utf-8">
+        <style>
+            body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }
+            .card { background: #f5f5f5; padding: 20px; margin: 20px 0; border-radius: 8px; }
+            .success { color: #4CAF50; font-weight: bold; }
+            .warning { color: #FF9800; font-weight: bold; }
+            .error { color: #f44336; font-weight: bold; }
+            code { background: #eee; padding: 2px 6px; border-radius: 3px; }
+        </style>
+    </head>
+    <body>
+        <h1>🌐 Dostupnost API Server</h1>
+        <p>API для Android приложения мониторинга доступности базовых станций</p>
+        
+        <div class="card">
+            <h2>📊 Статус системы</h2>
+            <p>Режим авторизации: <span class="success">{}</span></p>
+            <p>LDAP сервер: <span class="{}">{}</span></p>
+            <p>Фолбэк пользователей: <span class="success">{}</span></p>
+            <p>GitHub репозиторий: <code>{}</code></p>
+        </div>
+        
+        <div class="card">
+            <h2>🔗 Основные Endpoints</h2>
+            <ul>
+                <li><code>POST /api/auth/login</code> - Авторизация (LDAP/фолбэк)</li>
+                <li><code>GET /api/region/{code}</code> - Данные региона</li>
+                <li><code>GET /api/region/{code}/history</code> - История региона</li>
+                <li><code>GET /api/regions</code> - Список регионов</li>
+                <li><code>GET /api/auth/ldap/test</code> - Тест LDAP</li>
+                <li><code>GET /api/health</code> - Проверка здоровья</li>
+            </ul>
+        </div>
+        
+        <div class="card">
+            <h2>⚙️ Настройка LDAP</h2>
+            <p>1. Запустите LDAP сервер на вашем компьютере</p>
+            <p>2. Откройте порт 8443 на роутере:</p>
+            <pre>Внешний порт 8443 → Внутренний IP:8443</pre>
+            <p>3. Узнайте внешний IP: <code>curl ifconfig.me</code></p>
+            <p>4. В Render.com добавьте переменную:</p>
+            <pre>LDAP_SERVER_URL = https://[ВАШ_IP]:8443/api/ldap/auth</pre>
+        </div>
+    </body>
+    </html>
+    """.format(
+        AUTH_MODE,
+        'success' if LDAP_SERVER_URL else 'warning',
+        LDAP_SERVER_URL or 'Не настроен',
+        len(FALLBACK_USERS),
+        GITHUB_REPO
+    )
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
+    
+    print("=" * 60)
+    print("🚀 ЗАПУСК DOSTUPNOST API СЕРВЕРА")
+    print("=" * 60)
+    print(f"\n⚙️  КОНФИГУРАЦИЯ:")
+    print(f"   • Режим авторизации: {AUTH_MODE}")
+    print(f"   • LDAP сервер: {LDAP_SERVER_URL or 'Не настроен'}")
+    print(f"   • GitHub репозиторий: {GITHUB_REPO}")
+    print(f"   • Фолбэк пользователей: {len(FALLBACK_USERS)}")
+    
+    print(f"\n📋 ДОСТУПНЫЕ ENDPOINTS:")
+    print(f"   • POST /api/auth/login")
+    print(f"   • GET  /api/region/{{code}}")
+    print(f"   • GET  /api/region/{{code}}/history")
+    print(f"   • GET  /api/regions")
+    print(f"   • GET  /api/auth/health")
+    
+    print(f"\n🔧 НАСТРОЙКА LDAP:")
+    print(f"   1. Установите LDAP_SERVER_URL в Render.com")
+    print(f"   2. Формат: https://ваш_ip:8443/api/ldap/auth")
+    print(f"   3. Для теста используйте: admin/admin")
+    
     app.run(host='0.0.0.0', port=port, debug=False)
