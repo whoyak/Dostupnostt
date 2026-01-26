@@ -1,13 +1,12 @@
 """
 🌐 API СЕРВЕР ДЛЯ ANDROID ПРИЛОЖЕНИЯ
-Запускается на Render.com, берет данные из GitHub
+Запускается на Render.com, берет РЕАЛЬНЫЕ данные из GitHub
 """
 
 import os
 import requests
 import logging
 import json
-import base64
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -37,22 +36,10 @@ class Config:
     
     # ⚙️ Настройки запросов
     REQUEST_TIMEOUT = int(os.environ.get('REQUEST_TIMEOUT', 10))
-    CACHE_TIMEOUT = int(os.environ.get('CACHE_TIMEOUT', 300))  # кеширование 5 минут
+    CACHE_TIMEOUT = int(os.environ.get('CACHE_TIMEOUT', 60))  # кеширование 60 секунд
     
-    # 🔧 Прямой доступ к GitHub API (если нужна история через API)
-    USE_GITHUB_API = os.environ.get('USE_GITHUB_API', 'false').lower() == 'true'
-    
-    # 📋 Список доступных регионов
-    AVAILABLE_REGIONS = [
-        'BRT', 'IRK', 'KAM', 'KHB', 'SAH', 'VLD', 'BIR', 'AND', 'MGD', 'CHV',
-        'IZH', 'KAZ', 'NIN', 'SAM', 'YOL', 'KIR', 'ULN', 'CNT', 'NEA', 'NWS',
-        'SEA', 'SWS', 'ARH', 'KLN', 'MUR', 'NOV', 'PSK', 'PZV', 'SPE', 'SPN',
-        'SPS', 'SPW', 'VOL', 'NEN', 'BRN', 'KHA', 'KRS', 'NSK', 'OMS', 'TYV',
-        'GRN', 'KEM', 'TOM', 'CHE', 'EKT', 'HAN', 'KOM', 'ORB', 'PRM', 'TUM',
-        'YNR', 'KRG', 'UFA', 'IVN', 'KLG', 'KOS', 'RYZ', 'SMO', 'TUL', 'TVE',
-        'VLA', 'YRL', 'BEL', 'BRY', 'KUR', 'LIP', 'MRD', 'ORL', 'PNZ', 'SRV',
-        'TAM', 'VRN', 'KRA', 'ROS', 'STV', 'VLG'
-    ]
+    # 📋 Список доступных регионов (будем брать из данных)
+    AVAILABLE_REGIONS = []  # Инициализируем пустым, потом заполним
 
 # ================== КЕШИРОВАНИЕ ==================
 
@@ -95,14 +82,15 @@ def get_github_headers():
     
     return headers
 
-def fetch_from_github_raw(filename):
+def fetch_from_github_raw(filename, force_refresh=False):
     """Получить данные из GitHub через raw.githubusercontent.com"""
     cache_key = f"github_raw_{filename}"
     
-    # Проверяем кеш
-    cached_data = DataCache.get(cache_key)
-    if cached_data:
-        return cached_data
+    # Проверяем кеш, если не требуется принудительное обновление
+    if not force_refresh:
+        cached_data = DataCache.get(cache_key)
+        if cached_data:
+            return cached_data
     
     try:
         url = f"https://raw.githubusercontent.com/{Config.GITHUB_REPO}/{Config.GITHUB_BRANCH}/{filename}"
@@ -116,7 +104,11 @@ def fetch_from_github_raw(filename):
         
         if response.status_code == 200:
             if filename.endswith('.json'):
-                data = response.json()
+                try:
+                    data = response.json()
+                except json.JSONDecodeError as e:
+                    logger.error(f"❌ Ошибка парсинга JSON из {filename}: {e}")
+                    return None
             else:
                 data = response.text
             
@@ -128,97 +120,68 @@ def fetch_from_github_raw(filename):
             logger.warning(f"⚠️ GitHub RAW вернул {response.status_code}: {filename}")
             return None
             
+    except requests.exceptions.Timeout:
+        logger.error(f"⏰ Таймаут при запросе к GitHub: {filename}")
+        return None
     except Exception as e:
         logger.error(f"❌ Ошибка при запросе GitHub RAW: {filename} - {e}")
         return None
 
-def fetch_from_github_api(filename):
-    """Получить данные из GitHub через API (для получения метаданных)"""
-    if not Config.USE_GITHUB_API:
-        return None
-    
-    cache_key = f"github_api_{filename}"
-    
-    # Проверяем кеш
-    cached_data = DataCache.get(cache_key)
-    if cached_data:
-        return cached_data
-    
-    try:
-        url = f"https://api.github.com/repos/{Config.GITHUB_REPO}/contents/{filename}?ref={Config.GITHUB_BRANCH}"
-        
-        logger.info(f"🌐 Запрос к GitHub API: {filename}")
-        response = requests.get(
-            url, 
-            headers=get_github_headers(),
-            timeout=Config.REQUEST_TIMEOUT
-        )
-        
-        if response.status_code == 200:
-            data = response.json()
-            
-            if 'content' in data:
-                # Декодируем base64 контент
-                content = base64.b64decode(data['content']).decode('utf-8')
-                if filename.endswith('.json'):
-                    data['decoded_content'] = json.loads(content)
-                else:
-                    data['decoded_content'] = content
-            
-            # Кешируем
-            DataCache.set(cache_key, data)
-            logger.info(f"✅ Данные получены из GitHub API: {filename}")
-            return data
-        else:
-            logger.warning(f"⚠️ GitHub API вернул {response.status_code}: {filename}")
-            return None
-            
-    except Exception as e:
-        logger.error(f"❌ Ошибка при запросе GitHub API: {filename} - {e}")
-        return None
-
-def get_region_data(region_code):
-    """Получить данные региона из GitHub"""
+def get_region_data(region_code, force_refresh=False):
+    """Получить РЕАЛЬНЫЕ данные региона из GitHub"""
     region_code = region_code.upper()
     
     # Пробуем получить данные из файла региона
-    region_data = fetch_from_github_raw(f"region_{region_code}.json")
+    region_data = fetch_from_github_raw(f"region_{region_code}.json", force_refresh)
     if region_data and 'success' in region_data:
+        # Добавляем мета-информацию
+        region_data['source'] = 'github_raw'
+        region_data['data_type'] = 'region_file'
+        region_data['api_timestamp'] = datetime.now().isoformat()
         return region_data
     
     # Пробуем получить из основного файла
-    main_data = fetch_from_github_raw("cached_data.json")
+    main_data = fetch_from_github_raw("cached_data.json", force_refresh)
     if main_data and region_code in main_data:
         if 'current' in main_data[region_code]:
             region_data = main_data[region_code]['current']
             region_data['success'] = True
+            region_data['source'] = 'github_main'
+            region_data['data_type'] = 'main_file'
+            region_data['api_timestamp'] = datetime.now().isoformat()
             return region_data
     
-    # Если данные не найдены
+    # Если данные не найдены - возвращаем ошибку
     return {
         'success': False,
-        'error': f'Данные для региона {region_code} не найдены',
+        'error': f'Данные для региона {region_code} не найдены в GitHub',
         'region_code': region_code,
-        'timestamp': datetime.now().isoformat()
+        'timestamp': datetime.now().isoformat(),
+        'suggestions': [
+            'Убедитесь, что сборщик данных работает и загружает данные в GitHub',
+            f'Проверьте наличие файла region_{region_code}.json в репозитории',
+            f'Или проверьте наличие региона {region_code} в cached_data.json'
+        ]
     }
 
-def get_region_history(region_code):
-    """Получить историю региона из GitHub"""
+def get_region_history(region_code, force_refresh=False):
+    """Получить РЕАЛЬНУЮ историю региона из GitHub"""
     region_code = region_code.upper()
     
     # Пробуем получить историю из отдельного файла
-    history_data = fetch_from_github_raw(f"history_{region_code}.json")
+    history_data = fetch_from_github_raw(f"history_{region_code}.json", force_refresh)
     if history_data and 'history' in history_data:
         return {
             'success': True,
             'region_code': region_code,
             'history': history_data['history'],
             'count': len(history_data['history']),
+            'source': 'github_history_file',
             'timestamp': datetime.now().isoformat()
         }
     
     # Пробуем получить из основного файла
-    main_data = fetch_from_github_raw("cached_data.json")
+    main_data = fetch_from_github_raw("cached_data.json", force_refresh)
     if main_data and region_code in main_data:
         if 'history' in main_data[region_code]:
             return {
@@ -226,6 +189,7 @@ def get_region_history(region_code):
                 'region_code': region_code,
                 'history': main_data[region_code]['history'],
                 'count': len(main_data[region_code]['history']),
+                'source': 'github_main_file',
                 'timestamp': datetime.now().isoformat()
             }
     
@@ -237,23 +201,27 @@ def get_region_history(region_code):
         'timestamp': datetime.now().isoformat()
     }
 
-def get_all_regions_summary():
-    """Получить сводку по всем регионам"""
+def get_all_regions_summary(force_refresh=False):
+    """Получить РЕАЛЬНУЮ сводку по всем регионам"""
     # Пробуем получить основной файл
-    main_data = fetch_from_github_raw("cached_data.json")
+    main_data = fetch_from_github_raw("cached_data.json", force_refresh)
     
     if main_data and '_meta' in main_data:
+        # Обновляем список доступных регионов из данных
+        available_regions = [k for k in main_data.keys() if k != '_meta' and k != 'available_regions']
+        
         summary = {
             'success': True,
             'timestamp': datetime.now().isoformat(),
-            'total_regions': 0,
+            'total_regions': len(available_regions),
             'regions': [],
             'last_updated': main_data['_meta'].get('last_updated', 'unknown'),
+            'source': 'github_main_file',
             'statistics': {}
         }
         
         # Собираем данные по регионам
-        for region_code in Config.AVAILABLE_REGIONS:
+        for region_code in available_regions:
             if region_code in main_data:
                 region_info = main_data[region_code]
                 if 'current' in region_info:
@@ -267,10 +235,9 @@ def get_all_regions_summary():
                         'total_bs': stats.get('total_bs', 0),
                         'base_layer_percentage': stats.get('base_layer_percentage', 0),
                         'power_problems': stats.get('power_problems', 0),
-                        'timestamp': current.get('timestamp', 'unknown')
+                        'last_updated': current.get('timestamp', 'unknown'),
+                        'collected_at': current.get('collected_at', 'unknown')
                     })
-        
-        summary['total_regions'] = len(summary['regions'])
         
         # Статистика
         if summary['regions']:
@@ -286,48 +253,58 @@ def get_all_regions_summary():
     # Если основной файл не найден
     return {
         'success': False,
-        'error': 'Основной файл данных не найден',
-        'timestamp': datetime.now().isoformat()
+        'error': 'Основной файл данных не найден в GitHub',
+        'timestamp': datetime.now().isoformat(),
+        'github_repo': Config.GITHUB_REPO,
+        'github_branch': Config.GITHUB_BRANCH
     }
+
+def get_available_regions_from_github():
+    """Получить список доступных регионов из GitHub"""
+    main_data = fetch_from_github_raw("cached_data.json")
+    
+    if main_data:
+        # Получаем регионы из данных
+        available_regions = [k for k in main_data.keys() if k != '_meta' and k != 'available_regions']
+        return available_regions
+    
+    return []
 
 # ================== API ENDPOINTS ==================
 
 @app.route('/api/region/<region_code>', methods=['GET'])
 def region_data_endpoint(region_code):
     """
-    🗺️ Получение данных региона
+    🗺️ Получение данных региона (РЕАЛЬНЫЕ данные из GitHub)
     """
-    logger.info(f"🗺️ Запрос данных региона: {region_code}")
+    force_refresh = request.args.get('refresh', 'false').lower() == 'true'
+    
+    logger.info(f"🗺️ Запрос данных региона: {region_code} (refresh: {force_refresh})")
     
     region_code = region_code.upper()
-    if region_code not in Config.AVAILABLE_REGIONS:
-        return jsonify({
-            'success': False,
-            'error': f'Регион {region_code} не найден',
-            'available_regions': Config.AVAILABLE_REGIONS,
-            'timestamp': datetime.now().isoformat()
-        }), 404
     
-    region_data = get_region_data(region_code)
+    # Получаем актуальные данные
+    region_data = get_region_data(region_code, force_refresh)
+    
+    # Если регион не найден, но есть в списке доступных
+    if not region_data.get('success') and Config.AVAILABLE_REGIONS:
+        if region_code in Config.AVAILABLE_REGIONS:
+            region_data['warning'] = f'Регион {region_code} есть в списке, но данных нет в GitHub'
+    
     return jsonify(region_data)
 
 @app.route('/api/region/<region_code>/history', methods=['GET'])
 def region_history_endpoint(region_code):
     """
-    📊 Получение истории региона
+    📊 Получение истории региона (РЕАЛЬНАЯ история из GitHub)
     """
-    logger.info(f"📊 Запрос истории региона: {region_code}")
+    force_refresh = request.args.get('refresh', 'false').lower() == 'true'
+    
+    logger.info(f"📊 Запрос истории региона: {region_code} (refresh: {force_refresh})")
     
     region_code = region_code.upper()
-    if region_code not in Config.AVAILABLE_REGIONS:
-        return jsonify({
-            'success': False,
-            'error': f'Регион {region_code} не найден',
-            'available_regions': Config.AVAILABLE_REGIONS,
-            'timestamp': datetime.now().isoformat()
-        }), 404
     
-    history_data = get_region_history(region_code)
+    history_data = get_region_history(region_code, force_refresh)
     
     # Ограничиваем количество записей, если нужно
     limit = request.args.get('limit')
@@ -342,198 +319,275 @@ def region_history_endpoint(region_code):
 @app.route('/api/regions/summary', methods=['GET'])
 def regions_summary_endpoint():
     """
-    📈 Сводка по всем регионам
+    📈 Сводка по всем регионам (РЕАЛЬНЫЕ данные из GitHub)
     """
-    logger.info("📈 Запрос сводки по всем регионам")
-    summary = get_all_regions_summary()
+    force_refresh = request.args.get('refresh', 'false').lower() == 'true'
+    
+    logger.info(f"📈 Запрос сводки по всем регионам (refresh: {force_refresh})")
+    summary = get_all_regions_summary(force_refresh)
     return jsonify(summary)
 
 @app.route('/api/regions/list', methods=['GET'])
 def regions_list_endpoint():
     """
-    📋 Список всех доступных регионов
+    📋 Список всех доступных регионов (из GitHub)
     """
-    logger.info("📋 Запрос списка регионов")
+    force_refresh = request.args.get('refresh', 'false').lower() == 'true'
     
-    # Пробуем получить актуальные данные из GitHub
-    main_data = fetch_from_github_raw("cached_data.json")
+    logger.info(f"📋 Запрос списка регионов (refresh: {force_refresh})")
     
-    if main_data and '_meta' in main_data:
-        regions_list = []
-        for region_code in Config.AVAILABLE_REGIONS:
-            if region_code in main_data:
-                region_info = main_data[region_code]
-                if 'current' in region_info:
-                    current = region_info['current']
-                    regions_list.append({
-                        'code': region_code,
-                        'name': current.get('region_name', region_code),
-                        'macroregion': current.get('macroregion', 'Неизвестно'),
-                        'has_data': True,
-                        'last_updated': current.get('timestamp', 'unknown')
-                    })
-                else:
-                    regions_list.append({
-                        'code': region_code,
-                        'name': region_code,
-                        'macroregion': 'Неизвестно',
-                        'has_data': False,
-                        'last_updated': 'unknown'
-                    })
-            else:
-                regions_list.append({
-                    'code': region_code,
-                    'name': region_code,
-                    'macroregion': 'Неизвестно',
-                    'has_data': False,
-                    'last_updated': 'unknown'
-                })
+    # Получаем актуальные данные
+    summary = get_all_regions_summary(force_refresh)
+    
+    if summary.get('success'):
+        # Используем данные из сводки
+        return jsonify({
+            'success': True,
+            'count': len(summary['regions']),
+            'regions': summary['regions'],
+            'total_available': summary['total_regions'],
+            'last_updated': summary['last_updated'],
+            'timestamp': datetime.now().isoformat()
+        })
+    else:
+        # Если не удалось получить данные, возвращаем пустой список
+        return jsonify({
+            'success': False,
+            'error': summary.get('error', 'Не удалось получить список регионов'),
+            'count': 0,
+            'regions': [],
+            'timestamp': datetime.now().isoformat()
+        })
+
+@app.route('/api/refresh', methods=['POST'])
+def refresh_data_endpoint():
+    """
+    🔄 Принудительное обновление данных (очистка кеша)
+    """
+    logger.info("🔄 Принудительное обновление данных (очистка кеша)")
+    
+    # Простая проверка для безопасности
+    auth_token = request.headers.get('X-Refresh-Token')
+    if auth_token and auth_token == os.environ.get('REFRESH_TOKEN', ''):
+        # Очищаем кеш
+        cache_size_before = len(DataCache._cache)
+        DataCache.clear()
+        
+        # Обновляем список регионов
+        global_regions = get_available_regions_from_github()
+        if global_regions:
+            Config.AVAILABLE_REGIONS = global_regions
+        
+        logger.info(f"🗑️ Кеш очищен (было {cache_size_before} элементов)")
         
         return jsonify({
             'success': True,
-            'count': len(regions_list),
-            'regions': regions_list,
-            'total_available': len(Config.AVAILABLE_REGIONS),
-            'last_updated': main_data['_meta'].get('last_updated', 'unknown'),
+            'message': 'Кеш успешно очищен',
+            'cache_cleared': cache_size_before,
+            'regions_updated': len(global_regions) if global_regions else 0,
             'timestamp': datetime.now().isoformat()
         })
-    
-    # Если не удалось получить данные из GitHub
-    return jsonify({
-        'success': True,
-        'count': len(Config.AVAILABLE_REGIONS),
-        'regions': [{
-            'code': code,
-            'name': code,
-            'macroregion': 'Неизвестно',
-            'has_data': False
-        } for code in Config.AVAILABLE_REGIONS],
-        'total_available': len(Config.AVAILABLE_REGIONS),
-        'warning': 'Не удалось получить актуальные данные, показан список регионов по умолчанию',
-        'timestamp': datetime.now().isoformat()
-    })
-
-@app.route('/api/test/github', methods=['GET'])
-def test_github_endpoint():
-    """
-    🧪 Тестирование подключения к GitHub
-    """
-    logger.info("🧪 Тест подключения к GitHub")
-    
-    test_results = {
-        'test': 'github_connection_test',
-        'timestamp': datetime.now().isoformat(),
-        'config': {
-            'github_repo': Config.GITHUB_REPO,
-            'github_branch': Config.GITHUB_BRANCH,
-            'github_token_set': bool(Config.GITHUB_TOKEN),
-            'use_github_api': Config.USE_GITHUB_API,
-            'cache_timeout': Config.CACHE_TIMEOUT
-        },
-        'tests': {}
-    }
-    
-    # Тест 1: Проверка конфигурации
-    test_results['tests']['config_check'] = {
-        'passed': bool(Config.GITHUB_REPO),
-        'message': 'GitHub репозиторий настроен' if Config.GITHUB_REPO else 'GitHub репозиторий не настроен',
-        'repo': Config.GITHUB_REPO,
-        'branch': Config.GITHUB_BRANCH
-    }
-    
-    # Тест 2: Проверка основного файла
-    main_data = fetch_from_github_raw("cached_data.json")
-    test_results['tests']['main_file'] = {
-        'passed': main_data is not None,
-        'message': 'Основной файл данных найден' if main_data else 'Основной файл данных не найден',
-        'file': 'cached_data.json'
-    }
-    
-    # Тест 3: Проверка файла региона (пример BRT)
-    region_data = fetch_from_github_raw("region_BRT.json")
-    test_results['tests']['region_file'] = {
-        'passed': region_data is not None,
-        'message': 'Файл региона BRT найден' if region_data else 'Файл региона BRT не найден',
-        'file': 'region_BRT.json'
-    }
-    
-    # Тест 4: Количество доступных регионов
-    if main_data:
-        regions_in_data = [k for k in main_data.keys() if k != '_meta']
-        test_results['tests']['regions_count'] = {
-            'passed': len(regions_in_data) > 0,
-            'message': f'Найдено {len(regions_in_data)} регионов в данных',
-            'count': len(regions_in_data),
-            'regions': regions_in_data[:10]  # Показываем первые 10
-        }
-    
-    # Общая оценка
-    passed_tests = [t for t in test_results['tests'].values() if t.get('passed', False)]
-    if len(passed_tests) == len(test_results['tests']):
-        test_results['overall'] = 'PASSED'
-    elif len(passed_tests) >= 2:
-        test_results['overall'] = 'PARTIAL'
     else:
-        test_results['overall'] = 'FAILED'
-    
-    return jsonify(test_results)
-
-@app.route('/api/cache/clear', methods=['POST'])
-def clear_cache_endpoint():
-    """
-    🗑️ Очистка кеша (только для администраторов)
-    """
-    # Простая проверка для безопасности
-    auth_token = request.headers.get('X-Admin-Token')
-    if not auth_token or auth_token != os.environ.get('ADMIN_TOKEN', ''):
+        # Разрешаем обновление без токена, но с предупреждением
+        cache_size_before = len(DataCache._cache)
+        DataCache.clear()
+        
+        logger.warning(f"⚠️ Кеш очищен без авторизации (было {cache_size_before} элементов)")
+        
         return jsonify({
-            'success': False,
-            'error': 'Доступ запрещен',
+            'success': True,
+            'message': 'Кеш очищен (публичный доступ)',
+            'warning': 'Для защищенного доступа используйте X-Refresh-Token',
+            'cache_cleared': cache_size_before,
             'timestamp': datetime.now().isoformat()
-        }), 403
-    
-    DataCache.clear()
-    logger.info("🗑️ Кеш очищен")
-    
-    return jsonify({
-        'success': True,
-        'message': 'Кеш успешно очищен',
-        'timestamp': datetime.now().isoformat()
-    })
+        })
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """
-    🩺 Проверка здоровья API
+    🩺 Проверка здоровья API и подключения к GitHub
     """
     # Проверяем подключение к GitHub
-    main_data = fetch_from_github_raw("cached_data.json")
+    main_data = fetch_from_github_raw("cached_data.json", force_refresh=True)
     
-    return jsonify({
+    health_status = {
         'status': 'healthy',
         'service': 'region_data_api',
         'timestamp': datetime.now().isoformat(),
-        'github_connection': 'ok' if main_data else 'unavailable',
-        'cache_size': len(DataCache._cache),
+        'github': {
+            'connected': main_data is not None,
+            'repo': Config.GITHUB_REPO,
+            'branch': Config.GITHUB_BRANCH
+        },
+        'cache': {
+            'size': len(DataCache._cache),
+            'timeout_seconds': Config.CACHE_TIMEOUT
+        },
         'uptime': get_uptime(),
         'endpoints': [
-            '/api/region/{code}',
-            '/api/region/{code}/history',
-            '/api/regions/summary',
-            '/api/regions/list',
-            '/api/test/github',
-            '/api/health'
+            {'method': 'GET', 'path': '/api/region/{code}', 'desc': 'Данные региона'},
+            {'method': 'GET', 'path': '/api/region/{code}/history', 'desc': 'История региона'},
+            {'method': 'GET', 'path': '/api/regions/summary', 'desc': 'Сводка по регионам'},
+            {'method': 'GET', 'path': '/api/regions/list', 'desc': 'Список регионов'},
+            {'method': 'POST', 'path': '/api/refresh', 'desc': 'Обновление кеша'},
+            {'method': 'GET', 'path': '/api/health', 'desc': 'Проверка здоровья'}
         ]
-    })
+    }
+    
+    # Если GitHub недоступен, меняем статус
+    if not main_data:
+        health_status['status'] = 'degraded'
+        health_status['warning'] = 'GitHub недоступен'
+    
+    return jsonify(health_status)
 
 @app.route('/')
 def home():
     """
     🏠 Домашняя страница
     """
+    # Получаем актуальные данные для статуса
     main_data = fetch_from_github_raw("cached_data.json")
     
-   
+    if main_data:
+        github_status = "✅ OK"
+        github_status_class = "success"
+        if '_meta' in main_data:
+            last_updated = main_data['_meta'].get('last_updated', 'unknown')
+            # Преобразуем ISO строку в читаемый формат
+            try:
+                dt = datetime.fromisoformat(last_updated.replace('Z', '+00:00'))
+                last_updated = dt.strftime('%d.%m.%Y %H:%M:%S')
+            except:
+                pass
+        else:
+            last_updated = 'unknown'
+        
+        # Считаем регионы
+        regions_count = len([k for k in main_data.keys() if k != '_meta'])
+    else:
+        github_status = "❌ Ошибка"
+        github_status_class = "error"
+        last_updated = "неизвестно"
+        regions_count = 0
+    
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>🌐 Region Data API</title>
+        <meta charset="utf-8">
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }}
+            .card {{ background: #f5f5f5; padding: 20px; margin: 20px 0; border-radius: 8px; }}
+            .success {{ color: #4CAF50; font-weight: bold; }}
+            .warning {{ color: #FF9800; font-weight: bold; }}
+            .error {{ color: #f44336; font-weight: bold; }}
+            code {{ background: #eee; padding: 2px 6px; border-radius: 3px; }}
+            pre {{ background: #f8f8f8; padding: 10px; border-radius: 5px; overflow-x: auto; }}
+            .endpoint {{ background: #e8f5e8; padding: 10px; margin: 5px 0; border-left: 4px solid #4CAF50; }}
+            .refresh-btn {{ background: #4CAF50; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; }}
+            .refresh-btn:hover {{ background: #45a049; }}
+        </style>
+    </head>
+    <body>
+        <h1>🌐 Region Data API Server</h1>
+        <p>API сервер для Android приложения мониторинга доступности базовых станций</p>
+        <p>Данные берутся из GitHub репозитория: <code>{Config.GITHUB_REPO}</code> (ветка: <code>{Config.GITHUB_BRANCH}</code>)</p>
+        
+        <div class="card">
+            <h2>📊 Статус системы</h2>
+            <p>GitHub подключение: <span class="{github_status_class}">{github_status}</span></p>
+            <p>Последнее обновление данных: <span class="success">🕒 {last_updated}</span></p>
+            <p>Кеш: <span class="success">✅ {len(DataCache._cache)} элементов</span></p>
+            <p>Время работы сервера: <span class="success">✅ {get_uptime()}</span></p>
+            <p>Регионов доступно: <span class="success">✅ {regions_count}</span></p>
+            
+            <button class="refresh-btn" onclick="refreshCache()">🔄 Обновить данные</button>
+            <script>
+                function refreshCache() {{
+                    fetch('/api/refresh', {{ method: 'POST' }})
+                        .then(response => response.json())
+                        .then(data => {{
+                            if (data.success) {{
+                                alert('Кеш обновлен! Запрос новых данных из GitHub...');
+                                location.reload();
+                            }} else {{
+                                alert('Ошибка: ' + (data.error || 'Неизвестная ошибка'));
+                            }}
+                        }})
+                        .catch(error => {{
+                            alert('Ошибка сети: ' + error);
+                        }});
+                }}
+            </script>
+        </div>
+        
+        <div class="card">
+            <h2>🔗 Основные Endpoints</h2>
+            
+            <div class="endpoint">
+                <h3>GET <code>/api/region/{{code}}</code></h3>
+                <p>Получить данные конкретного региона</p>
+                <p><strong>Пример:</strong> <a href="/api/region/BRT" target="_blank">/api/region/BRT</a></p>
+                <p><strong>С параметром обновления:</strong> <a href="/api/region/BRT?refresh=true" target="_blank">/api/region/BRT?refresh=true</a></p>
+            </div>
+            
+            <div class="endpoint">
+                <h3>GET <code>/api/region/{{code}}/history</code></h3>
+                <p>Получить историю региона</p>
+                <p><strong>Пример:</strong> <a href="/api/region/BRT/history" target="_blank">/api/region/BRT/history</a></p>
+            </div>
+            
+            <div class="endpoint">
+                <h3>GET <code>/api/regions/summary</code></h3>
+                <p>Сводка по всем регионам</p>
+                <p><strong>Пример:</strong> <a href="/api/regions/summary" target="_blank">/api/regions/summary</a></p>
+            </div>
+            
+            <div class="endpoint">
+                <h3>GET <code>/api/regions/list</code></h3>
+                <p>Список всех доступных регионов</p>
+                <p><strong>Пример:</strong> <a href="/api/regions/list" target="_blank">/api/regions/list</a></p>
+            </div>
+            
+            <div class="endpoint">
+                <h3>GET <code>/api/health</code></h3>
+                <p>Проверка здоровья API</p>
+                <p><strong>Пример:</strong> <a href="/api/health" target="_blank">/api/health</a></p>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h2>⚙️ Конфигурация</h2>
+            <p>GitHub репозиторий: <code>{Config.GITHUB_REPO}</code></p>
+            <p>Ветка: <code>{Config.GITHUB_BRANCH}</code></p>
+            <p>Таймаут запросов: <code>{Config.REQUEST_TIMEOUT} секунд</code></p>
+            <p>Кеширование: <code>{Config.CACHE_TIMEOUT} секунд</code></p>
+            <p>GitHub токен: <code>{'Установлен' if Config.GITHUB_TOKEN else 'Не установлен'}</code></p>
+        </div>
+        
+        <div class="card">
+            <h2>📱 Для Android приложения</h2>
+            <p>В файле ApiClient.kt укажите базовый URL:</p>
+            <pre>private const val BASE_URL = "https://ваш-сервис.onrender.com/"</pre>
+            
+            <p>Пример кода для получения данных региона:</p>
+            <pre>
+// Kotlin пример с обновлением данных
+suspend fun getRegionData(regionCode: String, forceRefresh: Boolean = false): ApiResponse {{
+    val url = if (forceRefresh) {{
+        "/api/region/${{regionCode}}?refresh=true"
+    }} else {{
+        "/api/region/${{regionCode}}"
+    }}
+    return apiClient.get(url)
+}}</pre>
+        </div>
+    </body>
+    </html>
+    """
+
 # ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
 
 # Глобальная переменная для времени запуска
@@ -545,6 +599,23 @@ def get_uptime():
     hours, remainder = divmod(delta.total_seconds(), 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{int(hours)}ч {int(minutes)}м {int(seconds)}с"
+
+# ================== ИНИЦИАЛИЗАЦИЯ ==================
+
+# При запуске получаем список регионов из GitHub
+@app.before_first_request
+def initialize_app():
+    """Инициализация приложения при первом запросе"""
+    logger.info("🚀 Инициализация API сервера...")
+    
+    # Получаем список регионов из GitHub
+    global_regions = get_available_regions_from_github()
+    if global_regions:
+        Config.AVAILABLE_REGIONS = global_regions
+        logger.info(f"✅ Загружено {len(global_regions)} регионов из GitHub")
+    else:
+        logger.warning("⚠️ Не удалось загрузить регионы из GitHub, используется пустой список")
+        Config.AVAILABLE_REGIONS = []
 
 # ================== ЗАПУСК СЕРВЕРА ==================
 
@@ -562,23 +633,24 @@ if __name__ == '__main__':
     print(f"   • GitHub токен:       {'✅ Установлен' if Config.GITHUB_TOKEN else '⚠️ Не установлен'}")
     print(f"   • Таймаут запросов:   {Config.REQUEST_TIMEOUT} секунд")
     print(f"   • Кеширование:        {Config.CACHE_TIMEOUT} секунд")
-    print(f"   • Регионов доступно:  {len(Config.AVAILABLE_REGIONS)}")
     
     print(f"\n📋 ДОСТУПНЫЕ ENDPOINTS:")
-    print(f"   • GET /api/region/{{code}}          - Данные региона")
+    print(f"   • GET /api/region/{{code}}          - Данные региона (добавьте ?refresh=true для обновления)")
     print(f"   • GET /api/region/{{code}}/history  - История региона")
     print(f"   • GET /api/regions/summary         - Сводка по всем регионам")
     print(f"   • GET /api/regions/list            - Список регионов")
-    print(f"   • GET /api/test/github             - Тест GitHub")
+    print(f"   • POST /api/refresh                - Обновление кеша")
     print(f"   • GET /api/health                  - Проверка здоровья")
     
     print(f"\n📱 ДЛЯ ANDROID ПРИЛОЖЕНИЯ:")
     print(f"   Базовый URL: https://ваш-сервис.onrender.com/")
+    print(f"   Для обновления данных: ?refresh=true или POST /api/refresh")
     
     print(f"\n⚠️  ВАЖНО:")
-    print(f"   • Данные обновляются на GitHub каждые 10 минут")
-    print(f"   • API кеширует данные на {Config.CACHE_TIMEOUT} секунд")
-    print(f"   • Для увеличения лимита запросов установите GITHUB_TOKEN")
+    print(f"   • Только РЕАЛЬНЫЕ данные из GitHub, без заглушек")
+    print(f"   • Для принудительного обновления используйте параметр ?refresh=true")
+    print(f"   • Или отправьте POST запрос на /api/refresh")
+    print(f"   • Кеш автоматически обновляется каждые {Config.CACHE_TIMEOUT} секунд")
     print("=" * 70)
     
     print(f"\n🚀 Запуск API сервера на порту {port}...")
