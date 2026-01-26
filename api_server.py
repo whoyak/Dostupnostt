@@ -1,77 +1,24 @@
-"""
-API СЕРВЕР ДЛЯ ДОСТУПНОСТИ РЕГИОНОВ С ИСТОРИЧЕСКИМИ ДАННЫМИ
-Запускается на Render.com
-"""
-import time
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-import json
+# api_server.py
+import os
 import requests
 from datetime import datetime, timedelta
-import os
-import base64
-import uuid
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+from storage import get_storage
 
 app = Flask(__name__)
-CORS(app)  # Разрешаем CORS для всех доменов
-
-# === LDAP GATEWAY КОНФИГУРАЦИЯ ===
-# Эти настройки нужны для доменной авторизации
-LDAP_GATEWAY_ENABLED = True  # Включить доменную авторизацию через GitHub
-GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')  # Токен для GitHub API
-LDAP_GATEWAY_URL = "http://localhost:8080"  # Или URL вашего ldap_gateway_working.py
-LDAP_GATEWAY_TIMEOUT = 5
-GITHUB_REPO = "whoyak/region-data-cache"
-GITHUB_BRANCH = "main"
-
-# Фолбэк пользователи (если LDAP недоступен)
-FALLBACK_USERS = {
-    "operator": "operator123",
-    "viewer": "viewonly",
-    "test": "test123",
-    "admin": "admin"  # Добавил для тестирования
-}
+CORS(app)
 
 # Конфигурация
-GITHUB_RAW_BASE = "https://raw.githubusercontent.com/whoyak/region-data-cache/main/"
-CACHE_TIMEOUT = 60  # Кэшируем на 60 секунд
-
-# Кэш в памяти
-cache = {
-    'data': {},
-    'timestamp': datetime.min
+CONFIG = {
+    'ldap_server_url': os.environ.get('LDAP_SERVER_URL', 'http://localhost:8080'),
+    'api_port': int(os.environ.get('API_PORT', 5000)),
+    'enable_backup': os.environ.get('ENABLE_BACKUP', 'True').lower() == 'true',
+    'max_history_days': 30
 }
 
-def fetch_from_github(filename):
-    """Загружает данные из GitHub"""
-    try:
-        url = f"{GITHUB_RAW_BASE}{filename}"
-        response = requests.get(url, timeout=10)
+storage = get_storage()
 
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"⚠️ Файл {filename} не найден: {response.status_code}")
-            return None
-    except Exception as e:
-        print(f"❌ Ошибка загрузки {filename}: {e}")
-        return None
-
-def get_cached_data():
-    """Получает данные с кэшированием"""
-    global cache
-
-    now = datetime.now()
-    if (now - cache['timestamp']).seconds < CACHE_TIMEOUT and 'data' in cache:
-        return cache['data']
-
-    # Загружаем данные
-    data = fetch_from_github("cached_data.json")
-    if data:
-        cache['data'] = data
-        cache['timestamp'] = now
-
-    return data
 
 @app.route('/api/test', methods=['GET'])
 def test_connection():
@@ -80,43 +27,97 @@ def test_connection():
         'success': True,
         'message': 'API Dostupnost работает нормально',
         'timestamp': datetime.now().isoformat(),
-        'version': '1.0.0',
-        'features': ['current_data', 'full_history', 'historical_view']
+        'storage_type': 'filesystem',
+        'regions_count': len(storage.get_all_regions()),
+        'version': '1.0.0'
     })
+
+
+@app.route('/api/auth/login', methods=['POST'])
+def auth_login():
+    """Аутентификация пользователя"""
+    try:
+        data = request.json
+        username = data.get('username', '').strip()
+        password = data.get('password', '').strip()
+
+        if not username or not password:
+            return jsonify({'success': False, 'error': 'Missing credentials'}), 400
+
+        # Тестовая учетка
+        if username == 'admin' and password == 'admin':
+            return jsonify({
+                'success': True,
+                'username': 'admin',
+                'display_name': 'Администратор',
+                'auth_source': 'local',
+                'timestamp': datetime.now().isoformat()
+            })
+
+        # Проверяем через LDAP сервер
+        try:
+            ldap_response = requests.post(
+                f"{CONFIG['ldap_server_url']}/api/ldap/auth",
+                json={'username': username, 'password': password},
+                timeout=10
+            )
+
+            if ldap_response.status_code == 200:
+                result = ldap_response.json()
+                if result.get('success'):
+                    return jsonify(result)
+                else:
+                    return jsonify(result), 401
+
+        except requests.exceptions.RequestException as e:
+            print(f"⚠️ LDAP сервер недоступен: {e}")
+
+            # Фолбэк на локальную проверку
+            from ldap_server import ADAuthenticator
+            authenticator = ADAuthenticator()
+            result = authenticator.authenticate(username, password)
+
+            if result['success']:
+                return jsonify(result)
+            else:
+                return jsonify({
+                    'success': False,
+                    'error': 'Сервер авторизации недоступен',
+                    'details': str(e)
+                }), 503
+
+        return jsonify({
+            'success': False,
+            'error': 'Неверный логин или пароль'
+        }), 401
+
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': f'Ошибка аутентификации: {str(e)}'
+        }), 500
+
 
 @app.route('/api/region/<region_code>', methods=['GET'])
 def get_region_data(region_code):
     """Получение текущих данных региона"""
     try:
-        # Пробуем загрузить конкретный файл региона
-        filename = f"region_{region_code}.json"
-        data = fetch_from_github(filename)
+        region_code = region_code.upper()
+        data = storage.get_region_data(region_code)
 
         if data:
+            # Добавляем текущее время
+            data['api_timestamp'] = datetime.now().isoformat()
+            data['success'] = True
             return jsonify(data)
 
-        # Если нет отдельного файла, ищем в общем кэше
-        cached_data = get_cached_data()
-        if cached_data and region_code in cached_data:
-            return jsonify(cached_data[region_code]['current'])
-
-        # Если данных нет, возвращаем mock
+        # Если данных нет
         return jsonify({
-            'success': True,
+            'success': False,
+            'error': f'Регион {region_code} не найден',
             'region_code': region_code,
-            'region_name': f"Регион {region_code}",
-            'base_layer': f"{region_code} Базовый слой (тестовые данные)\n\nВсего BS: 100\nБазовый слой: 95/100",
-            'non_priority': f"{region_code} Технологии (тестовые данные)\n\nНедоступно LTE1800:\n1) BS1001",
-            'timestamp': datetime.now().strftime("%H:%M:%S"),
-            'is_mock': True,
-            'forced_refresh': False,
-            'stats': {
-                'total_bs': 100,
-                'base_layer_count': 95,
-                'power_problems': 3,
-                'non_priority_percentage': 5
-            }
-        })
+            'timestamp': datetime.now().isoformat()
+        }), 404
 
     except Exception as e:
         return jsonify({
@@ -124,72 +125,37 @@ def get_region_data(region_code):
             'error': str(e),
             'region_code': region_code
         }), 500
+
 
 @app.route('/api/region/<region_code>/history', methods=['GET'])
 def get_region_history(region_code):
-    """Получение истории региона (список записей)"""
+    """Получение истории региона"""
     try:
-        # Получаем параметр hours
+        region_code = region_code.upper()
         hours = int(request.args.get('hours', 24))
 
-        # Пробуем загрузить файл истории
-        filename = f"history_{region_code}.json"
-        data = fetch_from_github(filename)
+        history = storage.get_history(region_code, hours)
 
-        if data:
-            # Фильтруем по времени если нужно
-            if hours < 24:
-                cutoff_time = datetime.now() - timedelta(hours=hours)
-                filtered_history = []
-                for item in data.get('history', []):
-                    try:
-                        item_time = datetime.fromisoformat(item.get('full_timestamp', '2000-01-01').replace('Z', '+00:00'))
-                        if item_time > cutoff_time:
-                            filtered_history.append(item)
-                    except:
-                        filtered_history.append(item)
+        # Форматируем ответ
+        formatted_history = []
+        for item in history:
+            formatted_item = {
+                'region_code': item.get('region_code', region_code),
+                'region_name': item.get('region_name', f'Регион {region_code}'),
+                'timestamp': item.get('_history', {}).get('timestamp', ''),
+                'stats': item.get('stats', {}),
+                'base_layer_preview': item.get('base_layer', '')[:500] + '...' if len(
+                    item.get('base_layer', '')) > 500 else item.get('base_layer', '')
+            }
+            formatted_history.append(formatted_item)
 
-                data['history'] = filtered_history
-                data['count'] = len(filtered_history)
-
-            return jsonify(data)
-
-        # Если файла истории нет, ищем в кэше
-        cached_data = get_cached_data()
-        if cached_data and region_code in cached_data:
-            history = cached_data[region_code].get('history', [])
-
-            # Фильтруем по времени если нужно
-            if hours < 24:
-                cutoff_time = datetime.now() - timedelta(hours=hours)
-                filtered_history = []
-                for item in history:
-                    try:
-                        item_time = datetime.fromisoformat(item.get('full_timestamp', '2000-01-01').replace('Z', '+00:00'))
-                        if item_time > cutoff_time:
-                            filtered_history.append(item)
-                    except:
-                        filtered_history.append(item)
-
-                history = filtered_history
-
-            return jsonify({
-                'success': True,
-                'region_code': region_code,
-                'history': history,
-                'count': len(history),
-                'timestamp': datetime.now().isoformat(),
-                'message': 'Полная история с данными'
-            })
-
-        # Если истории нет, возвращаем пустую
         return jsonify({
             'success': True,
             'region_code': region_code,
-            'history': [],
-            'count': 0,
-            'timestamp': datetime.now().isoformat(),
-            'message': 'История пока пуста'
+            'history': formatted_history,
+            'count': len(formatted_history),
+            'hours': hours,
+            'timestamp': datetime.now().isoformat()
         })
 
     except Exception as e:
@@ -199,71 +165,58 @@ def get_region_history(region_code):
             'region_code': region_code
         }), 500
 
+
 @app.route('/api/region/<region_code>/history/<timestamp>', methods=['GET'])
 def get_historical_data(region_code, timestamp):
-    """Получение данных региона на конкретный момент времени"""
+    """Получение данных на конкретный момент времени"""
     try:
-        # Преобразуем timestamp из URL в нормальный формат
-        timestamp = timestamp.replace('-', ':').replace('T', ' ')
+        region_code = region_code.upper()
 
-        # Сначала пробуем загрузить конкретный файл исторических данных
-        filename = f"history_{region_code}_{timestamp}.json"
-        data = fetch_from_github(filename)
+        # Пытаемся распарсить timestamp
+        try:
+            # Форматируем timestamp (может быть в разных форматах)
+            if 'T' in timestamp:
+                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            else:
+                # Пробуем разные форматы
+                formats = ['%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y%m%d_%H%M%S']
+                dt = None
+                for fmt in formats:
+                    try:
+                        dt = datetime.strptime(timestamp, fmt)
+                        break
+                    except:
+                        continue
 
-        if data and data.get('historical_data'):
-            return jsonify({
-                'success': True,
-                'is_historical': True,
-                'historical_timestamp': timestamp,
-                'data': data['historical_data']
-            })
-
-        # Если нет отдельного файла, ищем в общей истории
-        history_response = fetch_from_github(f"history_{region_code}.json")
-        if history_response and history_response.get('history'):
-            # Ищем запись с ближайшим timestamp
-            target_time = None
-            try:
-                target_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-            except:
-                pass
-
-            closest_item = None
-            if target_time:
-                for item in history_response['history']:
-                    item_time = datetime.fromisoformat(item.get('full_timestamp', '2000-01-01').replace('Z', '+00:00'))
-                    if not closest_item or abs((item_time - target_time).total_seconds()) < abs((closest_item_time - target_time).total_seconds()):
-                        closest_item = item
-                        closest_item_time = item_time
-
-            if closest_item:
-                return jsonify({
-                    'success': True,
-                    'is_historical': True,
-                    'historical_timestamp': timestamp,
-                    'data': closest_item
-                })
-
-        # Ищем в кэше
-        cached_data = get_cached_data()
-        if cached_data and region_code in cached_data:
-            history = cached_data[region_code].get('history', [])
-
-            # Ищем по timestamp
-            for item in history:
-                if item.get('full_timestamp', '').startswith(timestamp) or item.get('timestamp', '') == timestamp:
+                if not dt:
                     return jsonify({
-                        'success': True,
-                        'is_historical': True,
-                        'historical_timestamp': timestamp,
-                        'data': item
-                    })
+                        'success': False,
+                        'error': 'Неверный формат времени'
+                    }), 400
+
+            iso_timestamp = dt.isoformat()
+
+        except:
+            return jsonify({
+                'success': False,
+                'error': 'Неверный формат времени'
+            }), 400
+
+        # Получаем исторические данные
+        data = storage.get_historical_data(region_code, iso_timestamp)
+
+        if data:
+            data['success'] = True
+            data['is_historical'] = True
+            data['historical_timestamp'] = iso_timestamp
+            data['api_timestamp'] = datetime.now().isoformat()
+            return jsonify(data)
 
         return jsonify({
             'success': False,
-            'error': f'Исторические данные для {region_code} на время {timestamp} не найдены',
+            'error': f'Исторические данные для {region_code} на время {iso_timestamp} не найдены',
             'region_code': region_code,
-            'timestamp': timestamp
+            'timestamp': iso_timestamp
         }), 404
 
     except Exception as e:
@@ -275,176 +228,29 @@ def get_historical_data(region_code, timestamp):
         }), 500
 
 
-@app.route('/api/auth/login', methods=['POST'])
-def auth_login():
-    """Аутентификация через GitHub файлы (LDAP Gateway)"""
-    try:
-        data = request.json
-        username = data.get('username', '').strip()
-        password = data.get('password', '').strip()
-
-        if not username or not password:
-            return jsonify({'success': False, 'error': 'Missing credentials'}), 400
-
-        print(f"🔐 Auth request for: {username}")
-
-        # Для быстрого теста - админ
-        if username.lower() == 'admin' and password == 'admin':
-            print(f"✅ Admin login (test)")
-            return jsonify({
-                'success': True,
-                'username': 'admin',
-                'display_name': 'Администратор',
-                'auth_source': 'test',
-                'timestamp': datetime.now().isoformat()
-            })
-
-        # 1. Создаем запрос для LDAP Gateway через GitHub
-        request_id = str(uuid.uuid4())[:8]
-        auth_request = {
-            'request_id': request_id,
-            'username': username,
-            'password': password,  # ⚠️ В открытом виде - нужно шифровать!
-            'created_at': datetime.now().isoformat(),
-            'source_ip': request.remote_addr,
-            'processed': False
-        }
-
-        try:
-            # 2. Загружаем текущие запросы с GitHub
-            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/ldap_requests.json"
-            headers = {
-                'Authorization': f'token {GITHUB_TOKEN}',
-                'Accept': 'application/vnd.github.v3+json'
-            }
-
-            response = requests.get(url, headers=headers, timeout=10)
-            current_requests = []
-            sha = None
-
-            if response.status_code == 200:
-                content = base64.b64decode(response.json()['content']).decode('utf-8')
-                current_requests = json.loads(content)
-                sha = response.json()['sha']
-
-            # 3. Добавляем новый запрос
-            current_requests.append(auth_request)
-
-            # 4. Сохраняем обратно на GitHub
-            content_encoded = base64.b64encode(
-                json.dumps(current_requests, indent=2).encode('utf-8')
-            ).decode('utf-8')
-
-            payload = {
-                'message': f'Auth request: {username}',
-                'content': content_encoded,
-                'branch': GITHUB_BRANCH
-            }
-            if sha:
-                payload['sha'] = sha
-
-            put_response = requests.put(url, headers=headers, json=payload, timeout=10)
-
-            if put_response.status_code in [200, 201]:
-                print(f"📝 Запрос {request_id} отправлен в очередь LDAP Gateway")
-            else:
-                print(f"⚠️ Ошибка сохранения запроса: {put_response.status_code}")
-                return jsonify({
-                    'success': False,
-                    'error': 'Не удалось отправить запрос авторизации'
-                }), 500
-
-        except Exception as e:
-            print(f"⚠️ Ошибка работы с GitHub API: {str(e)}")
-            # Продолжаем без GitHub - используем тестовых пользователей
-            pass
-
-        # Для быстрого теста - тестовые пользователи
-        TEST_USERS = {
-            "danil.vasilchenko": "ваш_пароль",
-            "danil": "ваш_пароль",
-            "operator": "operator123",
-            "viewer": "viewonly"
-        }
-
-        if username in TEST_USERS and TEST_USERS[username] == password:
-            print(f"✅ Test user login successful: {username}")
-            return jsonify({
-                'success': True,
-                'username': username,
-                'display_name': username.title(),
-                'auth_source': 'test',
-                'timestamp': datetime.now().isoformat()
-            })
-
-        return jsonify({
-            'success': False,
-            'error': 'Неверный логин или пароль',
-            'hint': 'Используйте тестовые учетки: admin/admin, operator/operator123'
-        }), 401
-
-    except Exception as e:
-        print(f"❌ Auth endpoint error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': f'Authentication error: {str(e)}'
-        }), 500
-
-@app.route('/api/auth/health', methods=['GET'])
-def auth_health():
-    """Проверка доступности авторизации"""
-    ldap_status = 'unknown'
-
-    try:
-        # Проверяем статус LDAP Gateway через GitHub
-        status_url = f"{GITHUB_RAW_BASE}ldap_status.json"
-        response = requests.get(status_url, timeout=5)
-
-        if response.status_code == 200:
-            status_data = response.json()
-            ldap_status = status_data.get('status', 'unknown')
-        else:
-            ldap_status = 'unavailable'
-    except:
-        ldap_status = 'unavailable'
-
-    return jsonify({
-        'success': True,
-        'ldap_gateway': {
-            'enabled': LDAP_GATEWAY_ENABLED,
-            'status': ldap_status,
-            'method': 'github_files'
-        },
-        'fallback_users': len(FALLBACK_USERS),
-        'timestamp': datetime.now().isoformat()
-    })
-
 @app.route('/api/region/<region_code>/refresh', methods=['POST'])
 def refresh_region_data(region_code):
     """Принудительное обновление данных региона"""
     try:
-        data = fetch_from_github(f"region_{region_code}.json")
+        # Здесь можно добавить логику обновления из парсера
+        # Пока просто возвращаем текущие данные с пометкой об обновлении
+
+        data = storage.get_region_data(region_code)
+
         if data:
             data['forced_refresh'] = True
             data['refresh_timestamp'] = datetime.now().isoformat()
+            data['success'] = True
+
+            # Сохраняем обновленные данные
+            storage.save_region_data(region_code, data)
+
             return jsonify(data)
 
         return jsonify({
-            'success': True,
-            'region_code': region_code,
-            'region_name': f"Регион {region_code} (обновлено)",
-            'base_layer': f"{region_code} Базовый слой (обновлено)\n\nВсего BS: 100\nБазовый слой: 95/100",
-            'non_priority': f"{region_code} Технологии (обновлено)\n\nНедоступно LTE1800:\n1) BS1001",
-            'timestamp': datetime.now().strftime("%H:%M:%S"),
-            'forced_refresh': True,
-            'refresh_timestamp': datetime.now().isoformat(),
-            'stats': {
-                'total_bs': 100,
-                'base_layer_count': 95,
-                'power_problems': 3,
-                'non_priority_percentage': 5
-            }
-        })
+            'success': False,
+            'error': f'Регион {region_code} не найден'
+        }), 404
 
     except Exception as e:
         return jsonify({
@@ -453,38 +259,29 @@ def refresh_region_data(region_code):
             'region_code': region_code
         }), 500
 
+
 @app.route('/api/regions', methods=['GET'])
 def get_all_regions():
-    """Получение списка всех регионов"""
+    """Получение списка всех регионов с краткой статистикой"""
     try:
-        cached_data = get_cached_data()
-        if cached_data and '_meta' in cached_data:
-            regions_list = []
-            for region_code, data in cached_data.items():
-                if region_code != '_meta':
-                    current = data.get('current', {})
-                    stats = current.get('stats', {})
-                    regions_list.append({
-                        'code': region_code,
-                        'name': current.get('region_name', region_code),
-                        'total_bs': stats.get('total_bs', 0),
-                        'base_layer_percentage': stats.get('base_layer_percentage', 0),
-                        'power_problems': stats.get('power_problems', 0),
-                        'last_updated': current.get('timestamp', '00:00:00'),
-                        'has_history': len(data.get('history', [])) > 0
-                    })
+        regions = storage.get_all_regions()
 
-            return jsonify({
-                'success': True,
-                'regions': regions_list,
-                'count': len(regions_list),
-                'timestamp': datetime.now().isoformat()
-            })
+        regions_list = []
+        for region_code in regions:
+            data = storage.get_region_data(region_code)
+            if data:
+                regions_list.append({
+                    'code': region_code,
+                    'name': data.get('region_name', region_code),
+                    'last_updated': data.get('_meta', {}).get('updated_at', ''),
+                    'stats': data.get('stats', {}),
+                    'has_history': len(storage.get_history(region_code, hours=1)) > 0
+                })
 
         return jsonify({
             'success': True,
-            'regions': [],
-            'count': 0,
+            'regions': regions_list,
+            'count': len(regions_list),
             'timestamp': datetime.now().isoformat()
         })
 
@@ -494,18 +291,110 @@ def get_all_regions():
             'error': str(e)
         }), 500
 
+
+@app.route('/api/storage/stats', methods=['GET'])
+def get_storage_stats():
+    """Получение статистики хранилища"""
+    try:
+        stats_file = os.path.join(storage.data_dir, 'meta', 'stats.json')
+
+        if os.path.exists(stats_file):
+            with open(stats_file, 'r') as f:
+                stats = json.load(f)
+        else:
+            stats = {
+                'total_regions': 0,
+                'last_updated': datetime.now().isoformat(),
+                'storage_size_mb': 0,
+                'history_entries': 0
+            }
+
+        stats['success'] = True
+        stats['storage_path'] = storage.data_dir
+        stats['timestamp'] = datetime.now().isoformat()
+
+        return jsonify(stats)
+
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/auth/health', methods=['GET'])
+def auth_health():
+    """Проверка доступности авторизации"""
+    try:
+        # Проверяем LDAP сервер
+        ldap_response = requests.get(
+            f"{CONFIG['ldap_server_url']}/api/ldap/health",
+            timeout=5
+        )
+
+        ldap_status = 'available' if ldap_response.status_code == 200 else 'unavailable'
+
+        return jsonify({
+            'success': True,
+            'ldap_server': ldap_status,
+            'storage': 'available',
+            'timestamp': datetime.now().isoformat()
+        })
+
+    except:
+        return jsonify({
+            'success': False,
+            'error': 'LDAP сервер недоступен'
+        }), 503
+
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """Health check для мониторинга"""
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.now().isoformat(),
-        'service': 'dostupnost-api',
-        'features': ['current_data', 'historical_data', 'full_history']
-    })
+    """Полная проверка здоровья системы"""
+    try:
+        # Проверяем хранилище
+        regions_count = len(storage.get_all_regions())
+
+        # Проверяем LDAP
+        ldap_ok = False
+        try:
+            ldap_response = requests.get(f"{CONFIG['ldap_server_url']}/api/ldap/health", timeout=3)
+            ldap_ok = ldap_response.status_code == 200
+        except:
+            pass
+
+        return jsonify({
+            'status': 'healthy',
+            'storage': {
+                'regions_count': regions_count,
+                'path': storage.data_dir,
+                'status': 'ok'
+            },
+            'ldap': {
+                'status': 'ok' if ldap_ok else 'unavailable',
+                'url': CONFIG['ldap_server_url']
+            },
+            'timestamp': datetime.now().isoformat(),
+            'version': '1.0.0'
+        })
+
+    except Exception as e:
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e),
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    print(f"🚀 API сервер запущен на порту {CONFIG['api_port']}")
+    print(f"📁 Хранилище: {storage.data_dir}")
+    print(f"🔐 LDAP сервер: {CONFIG['ldap_server_url']}")
+    print(f"🌐 Доступные endpoint'ы:")
+    print(f"  • /api/test - тест подключения")
+    print(f"  • /api/region/<code> - данные региона")
+    print(f"  • /api/region/<code>/history - история")
+    print(f"  • /api/regions - все регионы")
+    print(f"  • /api/health - проверка системы")
 
-
+    app.run(host='0.0.0.0', port=CONFIG['api_port'], debug=False)
